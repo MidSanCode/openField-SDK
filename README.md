@@ -2,6 +2,15 @@
 
 A cross-language SDK for the **OpenField** community bot API (`/api/v1/…`).
 
+```bash
+git clone https://github.com/MidSanCode/openField-SDK && cd openField-SDK
+```
+
+This repository is the **SDK**, `MidSanCode/openField-SDK`. The server it talks to is a
+different repository, [`MidSanCode/openField-server`](https://github.com/midSanCode/openField-server);
+where this README cites source files (`pkg/model/model.go`, `services/gateway/cmd/main.go`, …)
+or says "the source", it means that one.
+
 One Rust core does all the work. Two transports expose it to everything else:
 
 | Transport | What it is | Who uses it |

@@ -24,6 +24,15 @@
     "sdk",
     "chatbot"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MidSanCode/openField-SDK.git",
+    "directory": "bindings/node"
+  },
+  "homepage": "https://github.com/MidSanCode/openField-SDK#readme",
+  "bugs": {
+    "url": "https://github.com/MidSanCode/openField-SDK/issues"
+  },
   "license": "MIT OR Apache-2.0",
   "dependencies": {},
   "devDependencies": {}

@@ -15,6 +15,7 @@ Requires Node 18 or newer (`node:test` and ESM).
 Not on npm; use the checkout:
 
 ```bash
+git clone https://github.com/MidSanCode/openField-SDK && cd openField-SDK
 cargo build --workspace
 cd bindings/node && npm install   # no dependencies; sets up the package
 ```

@@ -15,6 +15,7 @@ Both expose the identical method surface, because both dispatch through the same
 Not on PyPI; use the checkout:
 
 ```bash
+git clone https://github.com/MidSanCode/openField-SDK && cd openField-SDK
 cargo build --workspace
 pip install -e bindings/python
 ```

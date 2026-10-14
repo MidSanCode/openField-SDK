@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/midSanCode/openField-server"
+repository = "https://github.com/MidSanCode/openField-SDK"
 description = "OpenField community bot SDK: a Rust core with sidecar and C-ABI transports"
 
 [workspace.dependencies]

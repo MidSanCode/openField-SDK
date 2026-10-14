@@ -25,7 +25,10 @@ dependencies = []
 dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.5"]
 
 [project.urls]
-Documentation = "https://github.com/midSanCode/openField-server"
+Repository = "https://github.com/MidSanCode/openField-SDK"
+Issues = "https://github.com/MidSanCode/openField-SDK/issues"
+Documentation = "https://github.com/MidSanCode/openField-SDK/blob/main/docs/protocol.md"
+Server = "https://github.com/midSanCode/openField-server"
 
 [tool.hatch.build.targets.wheel]
 packages = ["openfield_bot"]
