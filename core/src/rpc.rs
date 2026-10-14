@@ -137,6 +137,55 @@ pub const METHODS: &[&str] = &[
     "storage.upload_many",
     "storage.list",
     "storage.delete",
+    "storage.attachment",
+    "storage.by_hash",
+    "storage.burn_arm",
+    "storage.chunk_init",
+    "storage.chunk_upload",
+    "storage.chunk_status",
+    "storage.chunk_complete",
+    "storage.chunked",
+    // wallet
+    "wallet.get",
+    "wallet.adjust",
+    "wallet.recharge",
+    "wallet.deduct",
+    // tasks and experience
+    "tasks.list",
+    "tasks.claim",
+    "tasks.claim_daily",
+    "tasks.login_claim",
+    "tasks.login_calendar",
+    "tasks.makeup",
+    "tasks.makeup_date",
+    "tasks.exp_history",
+    // membership and the payment pin
+    "membership.get",
+    "membership.purchase",
+    "membership.auto_renew",
+    "membership.purchases",
+    "membership.grant",
+    "membership.exp_adjust",
+    "account.pin_set",
+    "account.pin_change",
+    "account.pin_verify",
+    // punishments
+    "moderation.punish",
+    "moderation.punishments",
+    // end-to-end encryption
+    "e2ee.set_key",
+    "e2ee.keys",
+    "e2ee.put_keys",
+    // plugin store
+    "plugins.list",
+    "plugins.get",
+    "plugins.download",
+    "plugins.upload",
+    "plugins.publish",
+    "plugins.unpublish",
+    "plugins.delete",
+    // tips
+    "posts.tip",
     // moderation
     "reports.create",
     "reports.mine",
@@ -678,6 +727,242 @@ impl RpcState {
             "storage.list" => to_value(self.bot()?.attachments()?),
             "storage.delete" => {
                 to_value(self.bot()?.delete_attachment(params.id("attachment_id")?)?)
+            }
+            "storage.attachment" => to_value(self.bot()?.attachment(params.id("attachment_id")?)?),
+            "storage.by_hash" => to_value(self.bot()?.attachment_by_hash(&params.string("hash")?)?),
+            "storage.burn_arm" => {
+                let attachment_id = params.id("attachment_id")?;
+                let burn_seconds =
+                    params
+                        .opt_i64("burn_seconds")?
+                        .ok_or_else(|| SdkError::InvalidArgument {
+                            message: "`burn_seconds` is required".into(),
+                        })?;
+                to_value(
+                    self.bot()?
+                        .arm_attachment_burn(attachment_id, burn_seconds)?,
+                )
+            }
+            "storage.chunk_init" => {
+                let request: crate::client::storage::NewChunkedUpload =
+                    params.deserialize("upload")?;
+                to_value(self.bot()?.start_chunked_upload(&request)?)
+            }
+            "storage.chunk_upload" => {
+                let part: crate::client::storage::ChunkUploadRequest =
+                    params.deserialize("part")?;
+                to_value(self.bot()?.upload_chunk(&part)?)
+            }
+            "storage.chunk_status" => {
+                to_value(self.bot()?.chunk_status(&params.string("upload_id")?)?)
+            }
+            "storage.chunk_complete" => {
+                let request: crate::client::storage::NewChunkedUpload =
+                    params.deserialize("upload")?;
+                to_value(
+                    self.bot()?
+                        .complete_chunked_upload(&params.string("upload_id")?, &request)?,
+                )
+            }
+            "storage.chunked" => {
+                // The whole-file driver: init, the missing parts, then complete.
+                let upload: Upload = params.deserialize("upload")?;
+                let chunk_bytes = params
+                    .opt_i64("chunk_bytes")?
+                    .unwrap_or(crate::client::storage::MAX_CHUNK_BYTES as i64);
+                let chunk_bytes =
+                    chunk_bytes.clamp(1, crate::client::storage::MAX_CHUNK_BYTES as i64);
+                to_value(self.bot()?.upload_chunked(&upload, chunk_bytes as usize)?)
+            }
+
+            // --- wallet ------------------------------------------------------
+            "wallet.get" => {
+                let page = params.opt_i64("page")?;
+                let limit = params.opt_i64("limit")?;
+                to_value(self.bot()?.wallet(page, limit)?)
+            }
+            "wallet.adjust" => {
+                // Raw form: `amount` is signed and is stored exactly as sent. The
+                // handler never reconciles it with `type`, so a positive amount with
+                // `type: "deduct"` is a credit.
+                let amount: crate::Money = params.deserialize("amount")?;
+                if amount.is_zero() {
+                    return Err(SdkError::InvalidArgument {
+                        message: "`amount` must not be zero".into(),
+                    });
+                }
+                let adjustment = crate::NewWalletAdjustment {
+                    user_id: params.id("user_id")?,
+                    amount,
+                    kind: params.opt_string("type")?,
+                    description: params.opt_string("description")?,
+                };
+                if adjustment.user_id <= 0 {
+                    return Err(SdkError::InvalidArgument {
+                        message: "`user_id` must be a positive id".into(),
+                    });
+                }
+                to_value(self.bot()?.adjust_wallet(&adjustment)?)
+            }
+            "wallet.recharge" | "wallet.deduct" => {
+                // Signed-for-you form: `amount` is a positive decimal and the
+                // direction comes from the method name.
+                let user_id = params.id("user_id")?;
+                let amount: crate::Money = params.deserialize("amount")?;
+                let description = params.opt_string("description")?;
+                let mut adjustment = if method == "wallet.recharge" {
+                    crate::NewWalletAdjustment::recharge(user_id, amount)?
+                } else {
+                    crate::NewWalletAdjustment::deduct(user_id, amount)?
+                };
+                if let Some(description) = description {
+                    adjustment = adjustment.with_description(description);
+                }
+                to_value(self.bot()?.adjust_wallet(&adjustment)?)
+            }
+
+            // --- tasks -------------------------------------------------------
+            "tasks.list" => to_value(self.bot()?.tasks()?),
+            "tasks.claim" => to_value(self.bot()?.claim_task(&params.string("code")?)?),
+            "tasks.claim_daily" => to_value(self.bot()?.claim_daily_task(&params.string("code")?)?),
+            "tasks.login_claim" => to_value(self.bot()?.claim_daily_login()?),
+            "tasks.login_calendar" => to_value(self.bot()?.checkin_calendar()?),
+            "tasks.makeup" => to_value(self.bot()?.makeup_checkin()?),
+            "tasks.makeup_date" => {
+                to_value(self.bot()?.makeup_checkin_on(&params.string("date")?)?)
+            }
+            "tasks.exp_history" => to_value(self.bot()?.exp_history(params.opt_i64("limit")?)?),
+
+            // --- membership and the payment pin -------------------------------
+            "membership.get" => to_value(self.bot()?.membership()?),
+            "membership.purchase" => {
+                let request = crate::MembershipPurchaseRequest::new(
+                    params
+                        .opt_i64("level")?
+                        .ok_or_else(|| SdkError::InvalidArgument {
+                            message: "`level` is required".into(),
+                        })?,
+                    params.string("pin")?,
+                )?;
+                to_value(self.bot()?.purchase_membership(&request)?)
+            }
+            "membership.auto_renew" => {
+                let enabled = params.flag("enabled")?;
+                let pin = params.opt_string("pin")?;
+                to_value(self.bot()?.set_auto_renew(enabled, pin.as_deref())?)
+            }
+            "membership.purchases" => {
+                let page = params.opt_i64("page")?;
+                let limit = params.opt_i64("limit")?;
+                to_value(self.bot()?.membership_purchases(page, limit)?)
+            }
+            "membership.grant" => {
+                let user_id = params.id("user_id")?;
+                let level = params
+                    .opt_i64("level")?
+                    .ok_or_else(|| SdkError::InvalidArgument {
+                        message: "`level` is required".into(),
+                    })?;
+                to_value(
+                    self.bot()?
+                        .grant_membership(user_id, level, params.opt_i64("days")?)?,
+                )
+            }
+            "membership.exp_adjust" => {
+                let user_id = params.id("user_id")?;
+                let delta = params
+                    .opt_i64("delta")?
+                    .ok_or_else(|| SdkError::InvalidArgument {
+                        message: "`delta` is required".into(),
+                    })?;
+                let description = params.opt_string("description")?;
+                to_value(
+                    self.bot()?
+                        .adjust_exp(user_id, delta, description.as_deref())?,
+                )
+            }
+            "account.pin_set" => {
+                let pin = params.string("pin")?;
+                let old_pin = params.opt_string("old_pin")?;
+                to_value(self.bot()?.set_payment_pin(&pin, old_pin.as_deref())?)
+            }
+            "account.pin_change" => {
+                let old_pin = params.string("old_pin")?;
+                let pin = params.string("pin")?;
+                to_value(self.bot()?.change_payment_pin(&old_pin, &pin)?)
+            }
+            "account.pin_verify" => {
+                let valid = self.bot()?.verify_payment_pin(&params.string("pin")?)?;
+                Ok(json!({ "valid": valid }))
+            }
+
+            // --- punishments --------------------------------------------------
+            "moderation.punish" => {
+                let request: crate::PunishmentRequest = params.deserialize("punishment")?;
+                to_value(self.bot()?.punish(params.id("user_id")?, &request)?)
+            }
+            "moderation.punishments" => to_value(
+                self.bot()?
+                    .punishments(params.id("user_id")?, params.opt_i64("limit")?)?,
+            ),
+
+            // --- end-to-end encryption ----------------------------------------
+            "e2ee.set_key" => to_value(
+                self.bot()?
+                    .set_e2ee_public_key(&params.string("public_key")?)?,
+            ),
+            "e2ee.keys" => to_value(self.bot()?.e2ee_keys(params.id("conversation_id")?)?),
+            "e2ee.put_keys" => {
+                let envelopes: crate::E2eeEnvelopeMap = params.deserialize("envelopes")?;
+                to_value(
+                    self.bot()?
+                        .put_e2ee_keys(params.id("conversation_id")?, &envelopes)?,
+                )
+            }
+
+            // --- plugin store --------------------------------------------------
+            // The catalog is `authPublic`, so it goes through the anonymous
+            // transport and works even when `client.init` was given no token.
+            "plugins.list" => to_value(self.client_mut()?.anonymous()?.plugins()?),
+            "plugins.get" => {
+                let plugin_id = params.string("plugin_id")?;
+                to_value(self.client_mut()?.anonymous()?.plugin(&plugin_id)?)
+            }
+            "plugins.download" => {
+                // Binary out: the transports are JSON, so the bundle travels as base64
+                // and the size is echoed so a caller can pre-size a buffer.
+                let bytes = self.bot()?.download_plugin(&params.string("plugin_id")?)?;
+                Ok(json!({
+                    "size": bytes.len(),
+                    "bytes": crate::models::base64_encode(&bytes),
+                }))
+            }
+            "plugins.upload" => {
+                let upload: Upload = params.deserialize("upload")?;
+                let publish = params.flag("publish")?;
+                to_value(self.bot()?.upload_plugin(&upload, publish)?)
+            }
+            "plugins.publish" => {
+                to_value(self.bot()?.publish_plugin(&params.string("plugin_id")?)?)
+            }
+            "plugins.unpublish" => {
+                to_value(self.bot()?.unpublish_plugin(&params.string("plugin_id")?)?)
+            }
+            "plugins.delete" => to_value(self.bot()?.delete_plugin(&params.string("plugin_id")?)?),
+
+            // --- tips ----------------------------------------------------------
+            "posts.tip" => {
+                let amount =
+                    params
+                        .opt_i64("amount")?
+                        .ok_or_else(|| SdkError::InvalidArgument {
+                            message: "`amount` is required (whole coins)".into(),
+                        })?;
+                to_value(self.bot()?.tip_post(
+                    params.id("post_id")?,
+                    amount,
+                    &params.string("pin")?,
+                )?)
             }
 
             // --- moderation --------------------------------------------------

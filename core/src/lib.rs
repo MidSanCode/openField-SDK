@@ -62,17 +62,29 @@ pub mod rpc;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
-pub use client::account::{NameStyle, StartupCheck, IMAGE_FIELD};
+pub use client::account::{validate_pin, NameStyle, StartupCheck, IMAGE_FIELD, MAX_PIN_FAILURES};
 pub use client::bots::{validate_nickname, validate_username, MAX_BOTS_PER_OWNER};
 pub use client::camps::{CampUpdate, NewCamp};
 pub use client::chat::{
     burn_seconds_allowed, ChatRequest, ConversationSettings, MessageCursor, NewConversation,
     NewMessage, DEFAULT_MESSAGE_LIMIT, MAX_MESSAGE_LIMIT,
 };
+pub use client::e2ee::E2eeEnvelopeMap;
+pub use client::membership::{MembershipPurchaseRequest, MAX_MEMBERSHIP_LEVEL};
 pub use client::misc::{NewReport, MAX_REASON_CHARS, MAX_REPORTS_PER_HOUR};
-pub use client::posts::{NewPost, NewReply, MAX_ATTACHMENTS, MAX_CONTENT_BYTES};
+pub use client::moderation::{PunishmentRequest, PunishmentType};
+pub use client::plugins::{validate_plugin_id, BUNDLE_FIELD, MAX_BUNDLE_BYTES};
+pub use client::posts::{
+    NewPost, NewReply, NewTip, MAX_ATTACHMENTS, MAX_CONTENT_BYTES, MAX_TIP_COINS,
+    TIP_AUTHOR_PERCENT,
+};
 pub use client::request::{Request, RequestBody};
-pub use client::storage::{Upload, ATTACHMENT_FIELD};
+pub use client::storage::{
+    ChunkUploadRequest, NewChunkedUpload, Upload, ATTACHMENT_FIELD, CHUNK_FIELD, MAX_BURN_SECONDS,
+    MAX_CHUNK_BYTES, MAX_TOTAL_CHUNKS,
+};
+pub use client::tasks::{DAILY_LOGIN_CODE, DAILY_LOGIN_ROUTE, MAX_MAKEUP_DAYS};
+pub use client::wallet::{NewWalletAdjustment, KIND_DEDUCT, KIND_RECHARGE};
 pub use client::{AnyClient, AuthenticatedClient, BaseClient, ProfileUpdate};
 pub use config::{BotToken, Config, BOT_TOKEN_LEN, BOT_TOKEN_PREFIX, DEFAULT_BASE_URL};
 pub use error::{ApiErrorBody, ErrorKind, Result, SdkError};
@@ -83,13 +95,18 @@ pub use events::{
 pub use events::{EventControl, EventReceiver};
 pub use http::{HttpResponse, MultipartFile};
 pub use models::{
-    Announcement, AnnouncementList, Attachment, AttachmentList, Bot, BotList, Camp, CampMember,
-    Capabilities, ChunkedUpload, ConsentRequest, ConsentRequestList, Conversation,
-    ConversationDetail, CreatedBot, HealthReport, Id, JsonObject, Message, MessageKind,
-    MessagePage, Notification, NotificationList, Permission, PermissionSet, Post, PostPage,
+    Announcement, AnnouncementList, Attachment, AttachmentBurn, AttachmentList, Bot, BotList,
+    CalendarDay, Camp, CampMember, Capabilities, CheckinCalendar, ChunkReceipt, ChunkSession,
+    ChunkStatus, ClaimResult, ConsentRequest, ConsentRequestList, Conversation, ConversationDetail,
+    CreatedBot, DailyLoginClaim, E2eeKeyEnvelope, E2eeKeys, E2eePutResult, ExpAdjustment, ExpEntry,
+    ExpHistory, HealthReport, Id, JsonObject, MakeupResult, MemberTier, MembershipPurchase,
+    MembershipPurchaseList, MembershipStatus, Message, MessageKind, MessagePage, Money,
+    Notification, NotificationList, Permission, PermissionSet, Plugin, PluginList, PluginUpload,
+    Post, PostPage, PostTip, Punishment, PunishmentList, PunishmentReceipt, PurchaseResult,
     Reaction, Reply, ReplyPage, Report, ReportList, ReportTarget, ServiceHealth, StorageBucket,
-    StorageBucketList, StorageUsage, TokenResponse, User, Visibility, ADMINISTRATIVE_PERMISSIONS,
-    MENTION_EVERYONE,
+    StorageBucketList, StorageUsage, Task, TaskList, TokenResponse, User, Visibility,
+    WalletAdjustment, WalletPage, WalletTransaction, ADMINISTRATIVE_PERMISSIONS, MENTION_EVERYONE,
+    MONEY_SCALE,
 };
 pub use retry::{ReconnectPolicy, RetryPolicy};
 pub use rpc::{error_object, event_message, EventSink, RpcState, METHODS, PROTOCOL_VERSION};

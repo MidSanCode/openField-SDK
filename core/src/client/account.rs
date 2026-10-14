@@ -397,6 +397,94 @@ impl AuthenticatedClient {
         let body = serde_json::json!({ "bucket": bucket });
         self.put_json(&format!("{API_PREFIX}/users/me/storage-bucket"), &body)
     }
+
+    // --- the payment PIN ----------------------------------------------------
+
+    /// `POST /api/v1/users/me/pin` — set the six-digit payment PIN.
+    ///
+    /// The PIN authorizes every outgoing payment: tips, memberships and
+    /// transfers. **A freshly created bot has none**, so these are the calls a
+    /// spending bot must make first — without one, every payment endpoint answers
+    /// `403 payment pin not set`.
+    ///
+    /// Replacing an existing PIN requires the current one in `old_pin`; the
+    /// server answers `403` with `old_pin_required: true` when it is missing, so a
+    /// stolen token alone cannot rebind the payment second factor.
+    ///
+    /// # Errors
+    ///
+    /// * `400 pin is required`;
+    /// * `400 pin must be 6 digits` — [`validate_pin`] enforces this locally;
+    /// * `403 payment pin already set` — `old_pin` was missing;
+    /// * `401 invalid payment pin` — `old_pin` was wrong;
+    /// * `429 尝试次数过多，请稍后再试` — the shared PIN budget is exhausted.
+    pub fn set_payment_pin(&self, pin: &str, old_pin: Option<&str>) -> Result<JsonObject> {
+        validate_pin(pin)?;
+        let body = match old_pin {
+            Some(old) => serde_json::json!({ "pin": pin, "old_pin": old }),
+            None => serde_json::json!({ "pin": pin }),
+        };
+        self.post_json(&format!("{API_PREFIX}/users/me/pin"), &body)
+    }
+
+    /// `PUT /api/v1/users/me/pin` — replace the payment PIN.
+    ///
+    /// Unlike [`set_payment_pin`](Self::set_payment_pin), the current PIN is
+    /// mandatory here: the handler binds both fields as required and answers
+    /// `400 old_pin and pin are required` when either is absent, then
+    /// `400 pin not set` when no PIN exists yet.
+    pub fn change_payment_pin(&self, old_pin: &str, pin: &str) -> Result<JsonObject> {
+        validate_pin(pin)?;
+        if old_pin.trim().is_empty() {
+            return Err(SdkError::InvalidArgument {
+                message: "old_pin must not be empty".into(),
+            });
+        }
+        let body = serde_json::json!({ "old_pin": old_pin, "pin": pin });
+        self.put_json(&format!("{API_PREFIX}/users/me/pin"), &body)
+    }
+
+    /// `POST /api/v1/users/me/pin/verify` — check a PIN without spending.
+    ///
+    /// A wrong PIN is **counted** against the same five-failure budget that tips
+    /// and memberships use, so probing this endpoint can lock the account out of
+    /// spending for fifteen minutes. Returns `Ok(true)` only on `200`.
+    ///
+    /// # Errors
+    ///
+    /// * `400 pin is required`;
+    /// * `400 pin not set`;
+    /// * `401 invalid pin` — wrong, and counted;
+    /// * `429` — the budget is exhausted.
+    pub fn verify_payment_pin(&self, pin: &str) -> Result<bool> {
+        if pin.trim().is_empty() {
+            return Err(SdkError::InvalidArgument {
+                message: "pin must not be empty".into(),
+            });
+        }
+        let body = serde_json::json!({ "pin": pin });
+        let response: JsonObject =
+            self.post_json(&format!("{API_PREFIX}/users/me/pin/verify"), &body)?;
+        Ok(response
+            .get("valid")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+}
+
+/// How many failures the server tolerates before locking payments
+/// (`maxPinFailuresPerUser`), shared by every payment-PIN check.
+pub const MAX_PIN_FAILURES: u32 = 5;
+
+/// A payment PIN is exactly six digits (`security.ValidPin`).
+pub fn validate_pin(pin: &str) -> Result<&str> {
+    let trimmed = pin.trim();
+    if trimmed.len() != 6 || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SdkError::InvalidArgument {
+            message: "the payment pin must be exactly 6 digits".into(),
+        });
+    }
+    Ok(trimmed)
 }
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::models::Id;
+use crate::models::{base64_encode, Id, MONEY_SCALE};
 
 /// A request the mock server received, for assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +147,27 @@ pub struct MockState {
     messages: Mutex<HashMap<Id, Vec<Value>>>,
     attachments: Mutex<Vec<Value>>,
     reports: Mutex<Vec<Value>>,
+    /// Wallet balance in cents, plus the transaction log, so the mock can reject a
+    /// deduction the way `repository.ErrInsufficientBalance` does.
+    wallet_cents: Mutex<i64>,
+    wallet_transactions: Mutex<Vec<Value>>,
+    /// Task codes already claimed, which is what makes the second call a 409.
+    claimed_tasks: Mutex<Vec<String>>,
+    /// The account's payment PIN, if one has been set. Absent by default: a freshly
+    /// created bot really has none, which is why the payment endpoints answer 403.
+    pin: Mutex<Option<String>>,
+    membership_level: Mutex<i64>,
+    membership_auto_renew: Mutex<bool>,
+    membership_purchases: Mutex<Vec<Value>>,
+    /// Open chunked-upload sessions: id → uploaded 1-based indexes.
+    chunks: Mutex<HashMap<String, Vec<i64>>>,
+    /// Published plugin rows.
+    plugins: Mutex<Vec<Value>>,
+    /// Stored E2EE envelopes, keyed by conversation.
+    envelopes: Mutex<HashMap<Id, Vec<Value>>>,
+    punishments: Mutex<Vec<Value>>,
+    /// Attachments whose burn countdown has been armed: id → deadline string.
+    burns: Mutex<HashMap<Id, String>>,
     /// Connected WebSocket clients, each tagged with its own id so it can deregister
     /// itself when the socket drops.
     ws_clients: Mutex<Vec<(u64, Sender<String>)>>,
@@ -166,6 +187,38 @@ impl MockState {
             messages: Mutex::new(HashMap::new()),
             attachments: Mutex::new(Vec::new()),
             reports: Mutex::new(Vec::new()),
+            // A wallet with 1000 coins, so a membership purchase (100–400 coins), a
+            // tip and a make-up sign-in (100 coins each) all have room, and an
+            // over-deduction can still be forced.
+            wallet_cents: Mutex::new(1000 * MONEY_SCALE),
+            wallet_transactions: Mutex::new(Vec::new()),
+            claimed_tasks: Mutex::new(Vec::new()),
+            pin: Mutex::new(None),
+            membership_level: Mutex::new(0),
+            membership_auto_renew: Mutex::new(false),
+            membership_purchases: Mutex::new(Vec::new()),
+            chunks: Mutex::new(HashMap::new()),
+            // One published plugin, so the catalog, the detail call and the bundle
+            // download all have something to answer with.
+            plugins: Mutex::new(vec![json!({
+                "id": "demo",
+                "name": "Demo",
+                "version": "1.0.0",
+                "author": "bot",
+                "description": "a demo plugin",
+                "permissions": ["posts.view"],
+                "min_app_version": "0.1.0",
+                "verified": true,
+                "published": true,
+                "downloads": 3,
+                "file_size": 32,
+                "sha256": "a".repeat(64),
+                "created_at": "2026-10-10T15:20:12Z",
+                "updated_at": "2026-10-10T15:20:12Z"
+            })]),
+            envelopes: Mutex::new(HashMap::new()),
+            punishments: Mutex::new(Vec::new()),
+            burns: Mutex::new(HashMap::new()),
             ws_clients: Mutex::new(Vec::new()),
             tickets: Mutex::new(Vec::new()),
             fail_next: Mutex::new(HashMap::new()),
@@ -501,6 +554,22 @@ fn serve_connection(
         }
         drop(failures);
 
+        // Endpoints whose body is bytes rather than JSON are resolved first,
+        // because `route` can only answer a `Value`.
+        if let Some(reply) = binary_route(&state, &request) {
+            match reply {
+                BinaryReply::Bytes {
+                    status,
+                    content_type,
+                    body,
+                } => write_bytes(&mut writer, status, content_type, &body)?,
+                BinaryReply::Error { status, body } => {
+                    write_json(&mut writer, status, &body, None)?;
+                }
+            }
+            continue;
+        }
+
         let (status, body) = route(&state, &request);
         write_json(&mut writer, status, &body, None)?;
     }
@@ -556,17 +625,32 @@ fn route(state: &MockState, request: &IncomingRequest) -> (u16, Value) {
         );
     }
 
-    // Everything below needs a valid bot token ------------------------------
-    let token = request
-        .authorization()
-        .and_then(|value| value.strip_prefix("Bearer "));
-    match token {
-        None => return (401, json!({"error": "missing authorization token"})),
-        Some(value) if value != config.token => {
-            // A reset, unknown or banned bot all answer this (bots.md §3.3).
-            return (401, json!({"error": "invalid bot token"}));
+    // The plugin catalog is authPublic — it renders before sign-in — so these two
+    // routes sit above the token gate. Everything under `/plugins/admin/` and the
+    // bundle download stay below it.
+    if path == "/api/v1/plugins" && method == "GET" {
+        let plugins: Vec<Value> = state
+            .plugins
+            .lock()
+            .expect("mock plugins lock")
+            .iter()
+            .filter(|plugin| plugin.get("published").and_then(Value::as_bool) == Some(true))
+            .cloned()
+            .collect();
+        return (200, json!({"plugins": plugins}));
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/plugins/") {
+        if method == "GET" && !rest.contains('/') {
+            return match published_plugin(state, rest) {
+                Some(plugin) => (200, plugin),
+                None => (404, json!({"error": "plugin not found"})),
+            };
         }
-        Some(_) => {}
+    }
+
+    // Everything below needs a valid bot token ------------------------------
+    if let Some(refusal) = authorize(state, request) {
+        return refusal;
     }
 
     // Account ---------------------------------------------------------------
@@ -848,6 +932,51 @@ fn route(state: &MockState, request: &IncomingRequest) -> (u16, Value) {
             ("DELETE", [id_text]) if id_text.parse::<Id>().is_ok() => {
                 return (200, json!({"ok": true}));
             }
+            // Tips: the amount is a whole coin count and the payment PIN is the
+            // authorization, so the mock shares the PIN state with `/users/me/pin`.
+            ("POST", [id_text, "tips"]) if id_text.parse::<Id>().is_ok() => {
+                let post_id: Id = id_text.parse().unwrap();
+                let body = request_json(request);
+                let Some(amount) = body.get("amount").and_then(Value::as_i64) else {
+                    return (400, json!({"error": "amount and pin are required"}));
+                };
+                let pin = body.get("pin").and_then(Value::as_str).unwrap_or("");
+                if pin.is_empty() {
+                    return (400, json!({"error": "amount and pin are required"}));
+                }
+                if !(1..=100_000).contains(&amount) {
+                    return (400, json!({"error": "invalid tip amount"}));
+                }
+                if post_id == 777 {
+                    // The mock's own post, which the handler refuses to let you tip.
+                    return (400, json!({"error": "cannot tip your own post"}));
+                }
+                if post_id == 404 {
+                    return (404, json!({"error": "post not found"}));
+                }
+                if let Some(refusal) = reject_payment_pin(state, pin) {
+                    return refusal;
+                }
+                let cents = amount * MONEY_SCALE;
+                let net = cents * 95 / 100;
+                let mut balance = state.wallet_cents.lock().expect("mock wallet lock");
+                if *balance < cents {
+                    return (400, json!({"error": "insufficient balance"}));
+                }
+                *balance -= cents;
+                drop(balance);
+                return (
+                    201,
+                    json!({
+                        "id": state.id(),
+                        "post_id": post_id,
+                        "user_id": config.bot_id,
+                        "amount": cents,
+                        "net_amount": net,
+                        "created_at": "2026-10-10T15:20:12Z"
+                    }),
+                );
+            }
             _ => {}
         }
     }
@@ -1035,6 +1164,73 @@ fn route(state: &MockState, request: &IncomingRequest) -> (u16, Value) {
             ("GET", [_id, "todos"]) | ("GET", [_id, "announcements"]) => {
                 return (200, json!({"items": []}));
             }
+            // E2EE key distribution: the server is a relay and never inspects the
+            // ciphertext, so the mock only checks membership and the empty-batch rule.
+            ("GET", [id_text, "e2ee-keys"]) if id_text.parse::<Id>().is_ok() => {
+                let conversation_id: Id = id_text.parse().unwrap();
+                let envelopes = state
+                    .envelopes
+                    .lock()
+                    .expect("mock envelopes lock")
+                    .get(&conversation_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mine = envelopes
+                    .iter()
+                    .find(|envelope| {
+                        envelope.get("target_user_id").and_then(Value::as_i64)
+                            == Some(config.bot_id)
+                    })
+                    .cloned();
+                let version = envelopes
+                    .iter()
+                    .filter_map(|envelope| envelope.get("version").and_then(Value::as_i64))
+                    .max()
+                    .unwrap_or(0);
+                return (
+                    200,
+                    json!({
+                        "version": version,
+                        "envelopes": envelopes,
+                        "my_envelope": mine,
+                        "conversation_id": conversation_id,
+                    }),
+                );
+            }
+            ("POST", [id_text, "e2ee-keys"]) if id_text.parse::<Id>().is_ok() => {
+                let conversation_id: Id = id_text.parse().unwrap();
+                let body = request_json(request);
+                let Some(map) = body.get("envelopes").and_then(Value::as_object) else {
+                    return (400, json!({"error": "invalid request body"}));
+                };
+                if map.is_empty() {
+                    return (400, json!({"error": "no envelopes provided"}));
+                }
+                let mut store = state.envelopes.lock().expect("mock envelopes lock");
+                let entry = store.entry(conversation_id).or_default();
+                let version = entry
+                    .iter()
+                    .filter_map(|envelope| envelope.get("version").and_then(Value::as_i64))
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                // Go marshals `map[int64]string` with string keys, which is the
+                // shape the SDK has to produce.
+                for (target, ciphertext) in map {
+                    entry.push(json!({
+                        "id": state.id(),
+                        "conversation_id": conversation_id,
+                        "version": version,
+                        "target_user_id": target.parse::<Id>().unwrap_or(0),
+                        "ciphertext": ciphertext,
+                        "created_at": "2026-10-10T15:20:12Z"
+                    }));
+                }
+                return (
+                    200,
+                    json!({"message": "e2ee keys stored", "version": version}),
+                );
+            }
             _ => {}
         }
     }
@@ -1180,11 +1376,993 @@ fn route(state: &MockState, request: &IncomingRequest) -> (u16, Value) {
         return (200, json!({"ticket": ticket, "expires_in": 30}));
     }
 
+    // Wallet -----------------------------------------------------------------
+    if path == "/api/v1/wallet" && method == "GET" {
+        let page = request
+            .query_param("page")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1);
+        let limit = request
+            .query_param("limit")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(20);
+        let balance = *state.wallet_cents.lock().expect("mock wallet lock");
+        let transactions = state
+            .wallet_transactions
+            .lock()
+            .expect("mock transactions lock")
+            .clone();
+        return (
+            200,
+            json!({
+                "balance": coins_json(balance),
+                "transactions": transactions,
+                "page": page,
+                "limit": limit
+            }),
+        );
+    }
+    if path == "/api/v1/wallet/adjust" && method == "POST" {
+        let body = request_json(request);
+        let Some(user_id) = body.get("user_id").and_then(Value::as_i64) else {
+            return (400, json!({"error": "invalid request body"}));
+        };
+        let Some(raw_amount) = body.get("amount") else {
+            return (400, json!({"error": "invalid request body"}));
+        };
+        let Ok(amount) = serde_json::from_value::<crate::models::Money>(raw_amount.clone()) else {
+            return (400, json!({"error": "invalid request body"}));
+        };
+        if amount.cents() == 0 {
+            return (400, json!({"error": "amount must not be zero"}));
+        }
+        if user_id <= 0 {
+            return (400, json!({"error": "invalid user id"}));
+        }
+        if user_id == 404 {
+            return (404, json!({"error": "user not found"}));
+        }
+        // The handler stores `type` as given and never reconciles it with the sign,
+        // so the mock deliberately does not either.
+        let kind = body.get("type").and_then(Value::as_str).unwrap_or("");
+        let kind = if kind.is_empty() {
+            if amount.cents() > 0 {
+                "recharge"
+            } else {
+                "deduct"
+            }
+        } else {
+            kind
+        };
+        let mut balance = state.wallet_cents.lock().expect("mock wallet lock");
+        let next = *balance + amount.cents();
+        if next < 0 {
+            return (400, json!({"error": "insufficient balance"}));
+        }
+        *balance = next;
+        drop(balance);
+        let transaction = json!({
+            "id": state.id(),
+            "user_id": user_id,
+            "amount": coins_json(amount.cents()),
+            "balance_after": coins_json(next),
+            "type": kind,
+            "description": body.get("description").and_then(Value::as_str).unwrap_or(""),
+            "operator_id": config.bot_id,
+            "created_at": "2026-10-10T15:20:12Z"
+        });
+        state
+            .wallet_transactions
+            .lock()
+            .expect("mock transactions lock")
+            .push(transaction.clone());
+        return (
+            200,
+            json!({"balance": coins_json(next), "transaction": transaction}),
+        );
+    }
+
+    // Membership ------------------------------------------------------------
+    if path == "/api/v1/membership" && method == "GET" {
+        let level = *state.membership_level.lock().expect("mock member lock");
+        let auto_renew = *state
+            .membership_auto_renew
+            .lock()
+            .expect("mock auto-renew lock");
+        return (200, membership_status(level, auto_renew));
+    }
+    if path == "/api/v1/membership/purchase" && method == "POST" {
+        let body = request_json(request);
+        let level = body.get("level").and_then(Value::as_i64).unwrap_or(0);
+        let pin = body.get("pin").and_then(Value::as_str).unwrap_or("");
+        if level < 1 || pin.is_empty() {
+            return (400, json!({"error": "level and pin are required"}));
+        }
+        if level > 4 {
+            return (400, json!({"error": "invalid membership level"}));
+        }
+        if let Some(refusal) = reject_payment_pin(state, pin) {
+            return refusal;
+        }
+        let price = level * 100;
+        let mut balance = state.wallet_cents.lock().expect("mock wallet lock");
+        if *balance < price * MONEY_SCALE {
+            return (400, json!({"error": "insufficient balance"}));
+        }
+        *balance -= price * MONEY_SCALE;
+        drop(balance);
+        *state.membership_level.lock().expect("mock member lock") = level;
+        state
+            .membership_purchases
+            .lock()
+            .expect("mock purchases lock")
+            .push(json!({
+                "id": state.id(),
+                "level": level,
+                "tier_name": format!("Lv.{level}"),
+                "price_coins": price,
+                "kind": "purchase",
+                "created_at": "2026-10-10T15:20:12Z"
+            }));
+        let auto_renew = *state
+            .membership_auto_renew
+            .lock()
+            .expect("mock auto-renew lock");
+        return (
+            200,
+            json!({
+                "status": membership_status(level, auto_renew),
+                "paid": price,
+                "kind": "purchase"
+            }),
+        );
+    }
+    if path == "/api/v1/membership/auto-renew" && method == "PUT" {
+        let body = request_json(request);
+        let enabled = body
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if enabled {
+            let pin = body.get("pin").and_then(Value::as_str).unwrap_or("");
+            // Disabling needs only the token; enabling pre-authorizes charges and
+            // therefore goes through the same PIN gate as a purchase.
+            if let Some(refusal) = reject_payment_pin(state, pin) {
+                return refusal;
+            }
+        }
+        *state
+            .membership_auto_renew
+            .lock()
+            .expect("mock auto-renew lock") = enabled;
+        let level = *state.membership_level.lock().expect("mock member lock");
+        return (200, membership_status(level, enabled));
+    }
+    if path == "/api/v1/membership/purchases" && method == "GET" {
+        let page = request
+            .query_param("page")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1);
+        let limit = request
+            .query_param("limit")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(20);
+        let purchases = state
+            .membership_purchases
+            .lock()
+            .expect("mock purchases lock")
+            .clone();
+        return (
+            200,
+            json!({"purchases": purchases, "page": page, "limit": limit}),
+        );
+    }
+
+    // Tasks ------------------------------------------------------------------
+    if path == "/api/v1/tasks" && method == "GET" {
+        return (
+            200,
+            json!({
+                "tasks": task_catalog(state),
+                "streak": 4,
+                "makeup_cost": 100
+            }),
+        );
+    }
+    if path == "/api/v1/tasks/daily-login/claim" && method == "POST" {
+        let mut claimed = state.claimed_tasks.lock().expect("mock claimed lock");
+        let already = claimed.iter().any(|code| code == "daily_login");
+        if !already {
+            claimed.push("daily_login".to_string());
+        }
+        return (
+            200,
+            json!({"granted": !already, "exp": 20, "currency": 20, "streak": 5}),
+        );
+    }
+    if path == "/api/v1/tasks/daily-login/calendar" && method == "GET" {
+        return (
+            200,
+            json!({
+                "registered_at": "2026-08-01",
+                "today": "2026-08-04",
+                "signed": ["2026-08-01", "2026-08-02", "2026-08-04"],
+                "streak": 4,
+                "makeup_cost": 100,
+                "makeup_exp": 20,
+                "days": [
+                    {"date": "2026-08-01", "weekday": "Sat", "signed": true,
+                     "is_today": false, "days_ago": 3, "before": false},
+                    {"date": "2026-08-02", "weekday": "Sun", "signed": true,
+                     "is_today": false, "days_ago": 2, "before": false},
+                    {"date": "2026-08-03", "weekday": "Mon", "signed": false,
+                     "is_today": false, "days_ago": 1, "before": false},
+                    {"date": "2026-08-04", "weekday": "Tue", "signed": true,
+                     "is_today": true, "days_ago": 0, "before": false}
+                ]
+            }),
+        );
+    }
+    if path == "/api/v1/tasks/daily-login/makeup" && method == "POST" {
+        if request.query_param("gap").as_deref() == Some("wide") {
+            return (
+                409,
+                json!({"error": "make-up only covers the last three days"}),
+            );
+        }
+        let mut balance = state.wallet_cents.lock().expect("mock wallet lock");
+        let cost = 100;
+        if *balance < cost * MONEY_SCALE {
+            return (400, json!({"error": "insufficient balance"}));
+        }
+        *balance -= cost * MONEY_SCALE;
+        drop(balance);
+        return (
+            200,
+            json!({"granted": true, "exp": 20, "cost": cost, "streak": 5}),
+        );
+    }
+    if path == "/api/v1/tasks/daily-login/makeup-date" && method == "POST" {
+        let body = request_json(request);
+        let date = body.get("date").and_then(Value::as_str).unwrap_or("");
+        if date.is_empty() {
+            return (400, json!({"error": "date is required"}));
+        }
+        if date == "2026-08-04" {
+            return (400, json!({"error": "cannot make up today"}));
+        }
+        if date == "2099-01-01" {
+            return (400, json!({"error": "cannot make up a future date"}));
+        }
+        let mut balance = state.wallet_cents.lock().expect("mock wallet lock");
+        let cost = 100;
+        if *balance < cost * MONEY_SCALE {
+            return (400, json!({"error": "insufficient balance"}));
+        }
+        *balance -= cost * MONEY_SCALE;
+        drop(balance);
+        return (
+            200,
+            json!({"granted": true, "date": date, "exp": 20, "cost": cost, "streak": 5}),
+        );
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/tasks/daily/") {
+        if method == "POST" {
+            if let Some(code) = rest.strip_suffix("/claim") {
+                return claim_task(state, code);
+            }
+        }
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/tasks/") {
+        if method == "POST" {
+            if let Some(code) = rest.strip_suffix("/claim") {
+                if code.contains('/') {
+                    return (404, json!({"error": "task not found"}));
+                }
+                return claim_task(state, code);
+            }
+        }
+    }
+    if path == "/api/v1/exp/history" && method == "GET" {
+        return (
+            200,
+            json!({"entries": [
+                {"id": 1, "user_id": config.bot_id, "amount": 20, "reason": "daily_bonus",
+                 "description": "每日签到奖励", "created_at": "2026-10-10T15:20:12Z"},
+                {"id": 2, "user_id": config.bot_id, "amount": 10, "reason": "task",
+                 "description": "今日发布 1 篇帖子", "created_at": "2026-10-09T15:20:12Z"}
+            ]}),
+        );
+    }
+
+    // The payment PIN and the E2EE public key --------------------------------
+    if path == "/api/v1/users/me/e2ee-key" && method == "PUT" {
+        let body = request_json(request);
+        // The handler accepts an empty key and treats it as "clear"; the mock only
+        // has to prove the call reached the route and carried `public_key`.
+        if body.get("public_key").is_none() {
+            return (400, json!({"error": "invalid request body"}));
+        }
+        return (200, json!({"message": "e2ee public key updated"}));
+    }
+    if path == "/api/v1/users/me/pin" && method == "POST" {
+        let body = request_json(request);
+        let pin = body.get("pin").and_then(Value::as_str).unwrap_or("");
+        let old_pin = body.get("old_pin").and_then(Value::as_str).unwrap_or("");
+        if pin.len() != 6 || !pin.bytes().all(|byte| byte.is_ascii_digit()) {
+            return (400, json!({"error": "pin must be 6 digits"}));
+        }
+        let existing = state.pin.lock().expect("mock pin lock").clone();
+        if let Some(expected) = existing {
+            if old_pin.is_empty() {
+                return (
+                    403,
+                    json!({"error": "payment pin already set", "old_pin_required": true}),
+                );
+            }
+            if old_pin != expected {
+                return (401, json!({"error": "invalid payment pin"}));
+            }
+        }
+        *state.pin.lock().expect("mock pin lock") = Some(pin.to_string());
+        return (200, json!({"set": true, "has_pin": true}));
+    }
+    if path == "/api/v1/users/me/pin" && method == "PUT" {
+        let body = request_json(request);
+        let pin = body.get("pin").and_then(Value::as_str).unwrap_or("");
+        let old_pin = body.get("old_pin").and_then(Value::as_str).unwrap_or("");
+        if pin.is_empty() || old_pin.is_empty() {
+            return (400, json!({"error": "old_pin and pin are required"}));
+        }
+        if pin.len() != 6 || !pin.bytes().all(|byte| byte.is_ascii_digit()) {
+            return (400, json!({"error": "pin must be 6 digits"}));
+        }
+        let existing = state.pin.lock().expect("mock pin lock").clone();
+        let Some(expected) = existing else {
+            return (400, json!({"error": "pin not set"}));
+        };
+        if old_pin != expected {
+            return (401, json!({"error": "invalid pin"}));
+        }
+        *state.pin.lock().expect("mock pin lock") = Some(pin.to_string());
+        return (200, json!({"set": true, "has_pin": true}));
+    }
+    if path == "/api/v1/users/me/pin/verify" && method == "POST" {
+        let body = request_json(request);
+        let pin = body.get("pin").and_then(Value::as_str).unwrap_or("");
+        let existing = state.pin.lock().expect("mock pin lock").clone();
+        match existing {
+            None => return (400, json!({"error": "pin not set"})),
+            Some(expected) if expected != pin => {
+                return (401, json!({"error": "invalid pin"}));
+            }
+            Some(_) => return (200, json!({"valid": true})),
+        }
+    }
+
+    // Plugin store -----------------------------------------------------------
+    // The public catalog and detail routes are handled above the token gate.
+    if path == "/api/v1/plugins/admin/upload" && method == "POST" {
+        if !body_has_multipart_field(request, "file") {
+            return (400, json!({"error": "missing file field"}));
+        }
+        let publish = multipart_value(request, "publish").as_deref() == Some("true");
+        let plugin = json!({
+            "id": "demo", "name": "Demo", "version": "1.0.0", "author": "bot",
+            "description": "", "permissions": [], "min_app_version": "0.1.0",
+            "verified": false, "published": publish, "downloads": 0,
+            "file_size": 32, "sha256": "0".repeat(64),
+            "created_at": "2026-10-10T15:20:12Z", "updated_at": "2026-10-10T15:20:12Z"
+        });
+        let mut plugins = state.plugins.lock().expect("mock plugins lock");
+        plugins.retain(|existing| existing.get("id") != plugin.get("id"));
+        plugins.push(plugin.clone());
+        return (200, json!({"message": "uploaded", "plugin": plugin}));
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/plugins/admin/") {
+        if let Some(id) = rest.strip_suffix("/publish") {
+            return set_plugin_published(state, id, true);
+        }
+        if let Some(id) = rest.strip_suffix("/unpublish") {
+            return set_plugin_published(state, id, false);
+        }
+        if method == "DELETE" {
+            let mut plugins = state.plugins.lock().expect("mock plugins lock");
+            let before = plugins.len();
+            plugins.retain(|plugin| plugin.get("id").and_then(Value::as_str) != Some(rest));
+            if plugins.len() == before {
+                return (404, json!({"error": "plugin not found"}));
+            }
+            return (200, json!({"message": "deleted"}));
+        }
+    }
+
+    // Punishments ------------------------------------------------------------
+    if let Some(rest) = path.strip_prefix("/api/v1/users/") {
+        let segments: Vec<&str> = rest.split('/').collect();
+        match (method, segments.as_slice()) {
+            ("PUT", [id_text, "exp"]) if id_text.parse::<Id>().is_ok() => {
+                let user_id: Id = id_text.parse().unwrap();
+                if user_id == 404 {
+                    return (404, json!({"error": "user not found"}));
+                }
+                let body = request_json(request);
+                let delta = body.get("delta").and_then(Value::as_i64).unwrap_or(0);
+                return (200, json!({"exp": 1000 + delta, "level": 5}));
+            }
+            ("PUT", [id_text, "membership"]) if id_text.parse::<Id>().is_ok() => {
+                let body = request_json(request);
+                let level = body.get("level").and_then(Value::as_i64).unwrap_or(0);
+                if !(0..=4).contains(&level) {
+                    return (400, json!({"error": "invalid membership level"}));
+                }
+                *state.membership_level.lock().expect("mock member lock") = level;
+                let auto_renew = *state
+                    .membership_auto_renew
+                    .lock()
+                    .expect("mock auto-renew lock");
+                return (200, membership_status(level, auto_renew));
+            }
+            ("POST", [id_text, "punishments"]) if id_text.parse::<Id>().is_ok() => {
+                let user_id: Id = id_text.parse().unwrap();
+                let body = request_json(request);
+                let kind = body.get("type").and_then(Value::as_str).unwrap_or("");
+                let reason = body.get("reason").and_then(Value::as_str).unwrap_or("");
+                if user_id == 404 {
+                    return (404, json!({"error": "user not found"}));
+                }
+                if user_id == config.bot_id {
+                    return (403, json!({"error": "cannot punish yourself"}));
+                }
+                if user_id == 1 {
+                    return (403, json!({"error": "cannot punish an administrator"}));
+                }
+                if user_id == 2 {
+                    return (
+                        403,
+                        json!({"error": "insufficient rank to punish this user"}),
+                    );
+                }
+                match kind {
+                    "warning" | "demerit" | "ban" | "unban" => {}
+                    "revoke" | "restore" => {
+                        let key = body
+                            .get("permission_key")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if key.is_empty() {
+                            return (400, json!({"error": "permission_key is required"}));
+                        }
+                    }
+                    "temp_ban" => {
+                        let minutes = body
+                            .get("duration_minutes")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        if minutes <= 0 {
+                            return (
+                                400,
+                                json!({"error": "duration_minutes is required for temp_ban"}),
+                            );
+                        }
+                    }
+                    _ => return (400, json!({"error": "unknown punishment type"})),
+                }
+                let expires_at = if kind == "temp_ban" {
+                    Value::String("2026-10-10T16:20:12Z".to_string())
+                } else {
+                    Value::Null
+                };
+                let record = json!({
+                    "id": state.id(),
+                    "user_id": user_id,
+                    "operator_id": config.bot_id,
+                    "type": kind,
+                    "permission_key": body.get("permission_key").and_then(Value::as_str).unwrap_or(""),
+                    "reason": reason,
+                    "expires_at": expires_at,
+                    "created_at": "2026-10-10T15:20:12Z"
+                });
+                state
+                    .punishments
+                    .lock()
+                    .expect("mock punishments lock")
+                    .push(record.clone());
+                return (
+                    200,
+                    json!({
+                        "punishment_id": record["id"],
+                        "type": kind,
+                        "expires_at": expires_at
+                    }),
+                );
+            }
+            ("GET", [id_text, "punishments"]) if id_text.parse::<Id>().is_ok() => {
+                let user_id: Id = id_text.parse().unwrap();
+                if user_id == 404 {
+                    return (404, json!({"error": "user not found"}));
+                }
+                let punishments: Vec<Value> = state
+                    .punishments
+                    .lock()
+                    .expect("mock punishments lock")
+                    .iter()
+                    .filter(|record| record.get("user_id").and_then(Value::as_i64) == Some(user_id))
+                    .cloned()
+                    .collect();
+                return (
+                    200,
+                    json!({"punishments": punishments, "permission_bans": ["posts.create"]}),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Chunked uploads and attachment reuse ------------------------------------
+    if path == "/api/v1/attachments/chunk/init" && method == "POST" {
+        let body = request_json(request);
+        let filename = body.get("filename").and_then(Value::as_str).unwrap_or("");
+        let size = body.get("size").and_then(Value::as_i64).unwrap_or(0);
+        let total_chunks = body
+            .get("total_chunks")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if filename.is_empty() || size <= 0 || total_chunks <= 0 {
+            return (400, json!({"error": "invalid request"}));
+        }
+        if total_chunks > 10_000 {
+            return (400, json!({"error": "too many chunks"}));
+        }
+        if size > total_chunks * (8 * 1024 * 1024) {
+            return (
+                400,
+                json!({"error": "declared size exceeds chunk capacity"}),
+            );
+        }
+        if filename.trim() == "too-big.bin" {
+            return (413, json!({"error": "file too large"}));
+        }
+        let upload_id = format!("chunk-{}", state.id());
+        state
+            .chunks
+            .lock()
+            .expect("mock chunks lock")
+            .insert(upload_id.clone(), Vec::new());
+        return (
+            201,
+            json!({"upload_id": upload_id, "total_chunks": total_chunks}),
+        );
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/attachments/chunk/") {
+        if rest.ends_with("/complete") && method == "POST" {
+            let upload_id = rest.trim_end_matches("/complete").to_string();
+            let body = request_json(request);
+            let total_chunks = body
+                .get("total_chunks")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let mut sessions = state.chunks.lock().expect("mock chunks lock");
+            let Some(uploaded) = sessions.get(&upload_id).cloned() else {
+                return (404, json!({"error": "upload session not found"}));
+            };
+            let expected = if total_chunks > 0 {
+                total_chunks
+            } else {
+                uploaded.len() as i64
+            };
+            let missing: Vec<i64> = (1..=expected)
+                .filter(|index| !uploaded.contains(index))
+                .collect();
+            if !missing.is_empty() {
+                return (409, json!({"error": "missing chunks", "missing": missing}));
+            }
+            sessions.remove(&upload_id);
+            drop(sessions);
+            let attachment = json!({
+                "id": state.id(),
+                "user_id": config.bot_id,
+                "original_name": body.get("filename").and_then(Value::as_str).unwrap_or("big.bin"),
+                "mime_type": "application/octet-stream",
+                "size_bytes": body.get("size").and_then(Value::as_i64).unwrap_or(0),
+                "url": "https://cdn.example/assembled",
+                "visibility": "public",
+                "bucket": "default",
+                "created_at": "2026-10-10T15:20:12Z"
+            });
+            return (201, attachment);
+        }
+        let segments: Vec<&str> = rest.split('/').collect();
+        match (method, segments.as_slice()) {
+            ("GET", [upload_id]) => {
+                let sessions = state.chunks.lock().expect("mock chunks lock");
+                let Some(uploaded) = sessions.get(*upload_id) else {
+                    return (404, json!({"error": "upload session not found"}));
+                };
+                let mut sorted = uploaded.clone();
+                sorted.sort_unstable();
+                return (200, json!({"upload_id": upload_id, "uploaded": sorted}));
+            }
+            ("POST", [upload_id, index_text]) if index_text.parse::<i64>().is_ok() => {
+                let index: i64 = index_text.parse().unwrap();
+                let mut sessions = state.chunks.lock().expect("mock chunks lock");
+                let Some(uploaded) = sessions.get_mut(*upload_id) else {
+                    return (404, json!({"error": "upload session not found"}));
+                };
+                if index < 1 {
+                    return (400, json!({"error": "invalid chunk index"}));
+                }
+                // Go files a filename-less multipart part under the value slot, so
+                // the field simply has to be present either way.
+                if !body_has_multipart_field(request, "chunk") {
+                    return (400, json!({"error": "missing chunk field"}));
+                }
+                if !uploaded.contains(&index) {
+                    uploaded.push(index);
+                }
+                let size = request.body.len() as i64;
+                return (
+                    200,
+                    json!({"upload_id": upload_id, "index": index, "size": size}),
+                );
+            }
+            _ => {}
+        }
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/attachments/by-hash/") {
+        if method == "GET" && !rest.contains('/') {
+            let hash = rest.to_ascii_lowercase();
+            if hash.starts_with('f') && hash != "f".repeat(64) {
+                return (404, json!({"error": "attachment not found"}));
+            }
+            if hash == "a".repeat(64) {
+                return (
+                    200,
+                    json!({
+                        "id": 9001,
+                        "user_id": config.bot_id,
+                        "original_name": "chart.png",
+                        "mime_type": "image/png",
+                        "size_bytes": 3,
+                        "url": "https://cdn.example/reused",
+                        "visibility": "public",
+                        "created_at": "2026-10-10T15:20:12Z"
+                    }),
+                );
+            }
+            return (404, json!({"error": "attachment not found"}));
+        }
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/attachments/") {
+        let segments: Vec<&str> = rest.split('/').collect();
+        match (method, segments.as_slice()) {
+            ("GET", [id_text]) if id_text.parse::<Id>().is_ok() => {
+                let id: Id = id_text.parse().unwrap();
+                let attachments = state.attachments.lock().expect("mock attachments lock");
+                return match attachments
+                    .iter()
+                    .find(|attachment| attachment.get("id").and_then(Value::as_i64) == Some(id))
+                {
+                    Some(attachment) => (200, attachment.clone()),
+                    None => (404, json!({"error": "attachment not found"})),
+                };
+            }
+            ("POST", [id_text, "burn-arm"]) if id_text.parse::<Id>().is_ok() => {
+                let id: Id = id_text.parse().unwrap();
+                let body = request_json(request);
+                let seconds = body
+                    .get("burn_seconds")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                if !(1..=86_400).contains(&seconds) {
+                    return (400, json!({"error": "invalid request"}));
+                }
+                let mut burns = state.burns.lock().expect("mock burns lock");
+                // Idempotent on the server; the mock keeps the first deadline.
+                let burn_at = burns
+                    .entry(id)
+                    .or_insert_with(|| "2026-10-10T15:30:12Z".to_string())
+                    .clone();
+                return (200, json!({"id": id, "burn_at": burn_at}));
+            }
+            _ => {}
+        }
+    }
+
     (404, json!({"error": "not found"}))
+}
+
+/// Flip a plugin's published flag, the way `setPublished` does.
+fn set_plugin_published(state: &MockState, id: &str, published: bool) -> (u16, Value) {
+    let mut plugins = state.plugins.lock().expect("mock plugins lock");
+    let Some(plugin) = plugins
+        .iter_mut()
+        .find(|plugin| plugin.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return (404, json!({"error": "plugin not found"}));
+    };
+    if let Some(object) = plugin.as_object_mut() {
+        object.insert("published".to_string(), Value::Bool(published));
+    }
+    (200, json!({"message": "updated"}))
+}
+
+/// The membership status document, including the four-tier catalog.
+fn membership_status(level: i64, auto_renew: bool) -> Value {
+    let tiers: Vec<Value> = (1..=4)
+        .map(|tier| {
+            json!({
+                "level": tier,
+                "name": format!("Lv.{tier}"),
+                "description": "",
+                "price": tier * 100,
+                "exp_multiplier": 1.0 + (tier as f64) * 0.1,
+                "duration_days": 30,
+                "storage_bonus_mb": tier * 1024,
+                "allow_gradient": tier >= 3,
+                "allow_dynamic": tier >= 4
+            })
+        })
+        .collect();
+    json!({
+        "level": level,
+        "name": if level > 0 { format!("Lv.{level}") } else { String::new() },
+        "active": level > 0,
+        "expires_at": if level > 0 { Value::String("2026-11-09T15:20:12Z".into()) } else { Value::Null },
+        "exp_multiplier": 1.0 + (level as f64) * 0.1,
+        "tiers": tiers,
+        "member_days": 30,
+        "member_price": if level < 4 { (level + 1) * 100 } else { 0 },
+        "auto_renew": auto_renew
+    })
 }
 
 fn request_json(request: &IncomingRequest) -> Value {
     serde_json::from_slice(&request.body).unwrap_or(Value::Null)
+}
+
+/// The gateway's identity check: absent and unknown tokens both answer
+/// `401 invalid bot token`, matching `ResolveBotToken`.
+fn authorize(state: &MockState, request: &IncomingRequest) -> Option<(u16, Value)> {
+    let token = request
+        .authorization()
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match token {
+        None => Some((401, json!({"error": "missing authorization token"}))),
+        Some(value) if value != state.config.token => {
+            // A reset, unknown or banned bot all answer this (bots.md §3.3).
+            Some((401, json!({"error": "invalid bot token"})))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Render an integer cent count the way `model.Cents.MarshalJSON` does: as a
+/// decimal coin value, and as a plain integer when the cents divide evenly.
+fn coins_json(cents: i64) -> Value {
+    serde_json::to_value(crate::models::Money::from_cents(cents)).unwrap_or(Value::from(0))
+}
+
+/// Shared payment-PIN gate for tips, memberships and the PIN endpoints.
+///
+/// Returns the refusal the handler would write, or `None` to proceed. An unset
+/// PIN is a `403` (not a 401) because there is nothing to match against.
+fn reject_payment_pin(state: &MockState, pin: &str) -> Option<(u16, Value)> {
+    let stored = state.pin.lock().expect("mock pin lock").clone();
+    match stored {
+        None => Some((403, json!({"error": "payment pin not set"}))),
+        Some(expected) if expected != pin => Some((401, json!({"error": "invalid payment pin"}))),
+        Some(_) => None,
+    }
+}
+
+/// The mock task catalog, with progress chosen so both the claimable and the
+/// not-yet-earned paths are reachable.
+fn task_catalog(state: &MockState) -> Vec<Value> {
+    let claimed = state.claimed_tasks.lock().expect("mock claimed lock");
+    let row = |id: Id,
+               code: &str,
+               kind: &str,
+               name: &str,
+               reward_exp: i64,
+               reward_currency: i64,
+               target: i64,
+               progress: i64,
+               sort: i64| {
+        let completed = claimed.iter().any(|entry| entry == code);
+        let claimable = !completed && progress >= target;
+        json!({
+            "id": id, "code": code, "kind": kind, "name": name, "description": "",
+            "reward_exp": reward_exp, "reward_currency": reward_currency,
+            "target": target, "sort": sort,
+            "progress": progress, "completed": completed, "claimable": claimable,
+        })
+    };
+    vec![
+        row(
+            1,
+            "daily_posts_1",
+            "daily",
+            "今日发布 1 篇帖子",
+            10,
+            5,
+            1,
+            1,
+            10,
+        ),
+        row(
+            2,
+            "daily_posts_5",
+            "daily",
+            "今日发布 5 篇帖子",
+            40,
+            25,
+            5,
+            5,
+            11,
+        ),
+        row(
+            3,
+            "daily_posts_10",
+            "daily",
+            "今日发布 10 篇帖子",
+            100,
+            60,
+            10,
+            5,
+            12,
+        ),
+        row(
+            4,
+            "daily_chat_25",
+            "daily",
+            "今日聊天 25 条",
+            30,
+            15,
+            25,
+            25,
+            20,
+        ),
+        // Deliberately short of target, so a claim is a 409.
+        row(
+            5,
+            "daily_chat_100",
+            "daily",
+            "今日聊天 100 条",
+            200,
+            120,
+            100,
+            60,
+            21,
+        ),
+        row(6, "daily_login", "streak", "每日签到", 20, 20, 1, 0, 1),
+        row(7, "first_post", "once", "发布第一篇帖子", 50, 20, 1, 1, 2),
+    ]
+}
+
+/// Claim one task, applying the handler's three failure shapes.
+fn claim_task(state: &MockState, code: &str) -> (u16, Value) {
+    let catalog = task_catalog(state);
+    let Some(task) = catalog
+        .iter()
+        .find(|task| task.get("code").and_then(Value::as_str) == Some(code))
+    else {
+        return (404, json!({"error": "task not found"}));
+    };
+    if task.get("completed").and_then(Value::as_bool) == Some(true) {
+        return (409, json!({"error": "task already claimed"}));
+    }
+    if task.get("claimable").and_then(Value::as_bool) != Some(true) {
+        return (409, json!({"error": "task requirements not met"}));
+    }
+    state
+        .claimed_tasks
+        .lock()
+        .expect("mock claimed lock")
+        .push(code.to_string());
+    let exp = task.get("reward_exp").and_then(Value::as_i64).unwrap_or(0);
+    let currency = task
+        .get("reward_currency")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    (
+        200,
+        json!({"claimed": true, "exp": exp, "currency": currency}),
+    )
+}
+
+/// A published plugin row, or `None` when the id is unknown or unpublished.
+fn published_plugin(state: &MockState, id: &str) -> Option<Value> {
+    state
+        .plugins
+        .lock()
+        .expect("mock plugins lock")
+        .iter()
+        .find(|plugin| {
+            plugin.get("id").and_then(Value::as_str) == Some(id)
+                && plugin.get("published").and_then(Value::as_bool) == Some(true)
+        })
+        .cloned()
+}
+
+/// A reply that is bytes rather than JSON.
+///
+/// The router returns a [`Value`], so an endpoint that answers a zip (the plugin
+/// bundle download) is resolved by this type instead of being bent into JSON.
+pub enum BinaryReply {
+    /// A raw body with its content type.
+    Bytes {
+        /// HTTP status.
+        status: u16,
+        /// `Content-Type` header value.
+        content_type: &'static str,
+        /// The body.
+        body: Vec<u8>,
+    },
+    /// A JSON refusal.
+    Error {
+        /// HTTP status.
+        status: u16,
+        /// The JSON error object.
+        body: Value,
+    },
+}
+
+/// Handle the endpoints whose response is not JSON.
+///
+/// Called before [`route`] so the token check happens exactly once per request.
+fn binary_route(state: &MockState, request: &IncomingRequest) -> Option<BinaryReply> {
+    let path = request.path.as_str();
+    if request.method != "GET" {
+        return None;
+    }
+    let rest = path.strip_prefix("/api/v1/plugins/")?;
+    let id = rest.strip_suffix("/download")?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    if let Some(refusal) = authorize(state, request) {
+        return Some(BinaryReply::Error {
+            status: refusal.0,
+            body: refusal.1,
+        });
+    }
+    match published_plugin(state, id) {
+        Some(_) => Some(BinaryReply::Bytes {
+            status: 200,
+            content_type: "application/zip",
+            body: plugin_bundle(id),
+        }),
+        None => Some(BinaryReply::Error {
+            status: 404,
+            body: json!({"error": "plugin not found"}),
+        }),
+    }
+}
+
+/// A deterministic stand-in bundle, so a download test can assert on its bytes.
+fn plugin_bundle(id: &str) -> Vec<u8> {
+    let mut bytes = b"PK\x03\x04".to_vec();
+    bytes.extend_from_slice(id.as_bytes());
+    bytes.extend_from_slice(b"-bundle");
+    bytes
+}
+
+/// Write a raw body, mirroring [`write_json`]'s framing.
+fn write_bytes(
+    writer: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let mut response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
+        body.len()
+    );
+    response.push_str("Content-Disposition: attachment; filename=\"bundle.zip\"\r\n\r\n");
+    writer.write_all(response.as_bytes())?;
+    writer.write_all(body)?;
+    writer.flush()
 }
 
 fn body_has_multipart_field(request: &IncomingRequest, name: &str) -> bool {
@@ -1193,6 +2371,29 @@ fn body_has_multipart_field(request: &IncomingRequest, name: &str) -> bool {
         .body
         .windows(needle.len())
         .any(|window| window == needle.as_bytes())
+}
+
+/// Read a text part's value out of a `multipart/form-data` body.
+///
+/// Enough of a parser for the mock's own assertions: locate the part header, then
+/// take everything up to the next CRLF. Returns `None` when the part is absent.
+fn multipart_value(request: &IncomingRequest, name: &str) -> Option<String> {
+    let needle = format!("name=\"{name}\"");
+    let body = &request.body;
+    let start = body
+        .windows(needle.len())
+        .position(|window| window == needle.as_bytes())?;
+    let after_header = &body[start + needle.len()..];
+    let separator = b"\r\n\r\n";
+    let value_start = after_header
+        .windows(separator.len())
+        .position(|window| window == separator)?;
+    let value = &after_header[value_start + separator.len()..];
+    let end = value
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .unwrap_or(value.len());
+    Some(String::from_utf8_lossy(&value[..end]).trim().to_string())
 }
 
 fn redeem_ticket(state: &MockState, ticket: &str) -> bool {
@@ -1564,30 +2765,8 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     digest
 }
 
-/// Standard base64, used for the WebSocket handshake response.
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
+// The WebSocket handshake response and the bindings' binary transport share one
+// base64 implementation, from `crate::models`; the RFC vectors below cover both.
 
 #[cfg(test)]
 mod tests {

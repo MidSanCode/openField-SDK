@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SdkError};
-use crate::models::{Id, JsonObject, Post, Reaction, Reply, ReplyPage, Visibility};
+use crate::models::{Id, JsonObject, Post, PostTip, Reaction, Reply, ReplyPage, Visibility};
 
 use super::{pagination, AuthenticatedClient, API_PREFIX};
 
@@ -349,6 +349,92 @@ impl AuthenticatedClient {
     /// `GET /api/v1/users/:user_id/favorites/replies` — a user's favourite replies.
     pub fn favorite_replies(&self, user_id: Id) -> Result<ReplyPage> {
         self.get_json(&format!("{API_PREFIX}/users/{user_id}/favorites/replies"))
+    }
+
+    /// `POST /api/v1/posts/:post_id/tips` — tip a post with coins.
+    ///
+    /// `amount` is a whole **coin** count (`int64` on the wire), not the decimal
+    /// coin value the wallet uses; the recorded tip reports it back in cents.
+    /// `MAX_TIP_COINS` is the ceiling and `1` the floor. The post author
+    /// receives 95 % and the platform keeps 5 %; if the post is deleted the tips
+    /// are refunded to the tipper.
+    ///
+    /// The call is authorized by the **payment PIN**, which is why `pin` is part
+    /// of the body rather than the token alone. Wrong entries share the per-user
+    /// budget with every other payment check, and a bot that has never set a PIN
+    /// gets `403 payment pin not set` — see
+    /// [`set_payment_pin`](AuthenticatedClient::set_payment_pin).
+    ///
+    /// # Errors
+    ///
+    /// * `400 amount and pin are required`;
+    /// * `400 invalid tip amount` — below 1 or above [`MAX_TIP_COINS`];
+    /// * `400 cannot tip your own post`;
+    /// * `400 insufficient balance`;
+    /// * `403 payment pin not set`;
+    /// * `401 invalid payment pin`;
+    /// * `404 post not found` — absent, or not visible to the caller;
+    /// * `429 尝试次数过多，请稍后再试` — the PIN budget is exhausted.
+    pub fn tip_post(&self, post_id: Id, amount_coins: i64, pin: &str) -> Result<PostTip> {
+        let request = NewTip::new(post_id, amount_coins, pin)?;
+        let body = serde_json::to_value(&request).map_err(super::json_error)?;
+        self.post_json(&format!("{API_PREFIX}/posts/{post_id}/tips"), &body)
+    }
+}
+
+/// Largest tip, in whole coins (`post.go`: `maxTipCoins`).
+pub const MAX_TIP_COINS: i64 = 100_000;
+
+/// Share of each tip that reaches the author, in percent (`tipPlatformFeePercent`
+/// leaves 5 % with the platform).
+pub const TIP_AUTHOR_PERCENT: i64 = 95;
+
+/// A tip to submit.
+///
+/// The amount is a whole coin count, matching `post.go`'s `amount int64` —
+/// unlike the wallet, which speaks decimal coins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTip {
+    /// Coins to pay, `1..=MAX_TIP_COINS`.
+    pub amount: i64,
+    /// The caller's six-digit payment PIN.
+    pub pin: String,
+}
+
+impl NewTip {
+    /// A tip of `amount_coins`, authorized by `pin`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an amount outside `1..=MAX_TIP_COINS` and an empty PIN.
+    pub fn new(post_id: Id, amount_coins: i64, pin: impl Into<String>) -> Result<Self> {
+        if post_id <= 0 {
+            return Err(SdkError::InvalidArgument {
+                message: "post_id must be a positive id".into(),
+            });
+        }
+        if !(1..=MAX_TIP_COINS).contains(&amount_coins) {
+            return Err(SdkError::InvalidArgument {
+                message: format!("tip amount must be 1..={MAX_TIP_COINS} coins"),
+            });
+        }
+        let pin = pin.into();
+        if pin.trim().is_empty() {
+            return Err(SdkError::InvalidArgument {
+                message: "pin must not be empty".into(),
+            });
+        }
+        Ok(Self {
+            amount: amount_coins,
+            pin,
+        })
+    }
+
+    /// What the author receives for this tip, in **cents**.
+    ///
+    /// Mirrors `netTipAmount`: 95 % of `amount * 100`, rounded down.
+    pub fn author_cents(&self) -> i64 {
+        self.amount * crate::models::MONEY_SCALE * TIP_AUTHOR_PERCENT / 100
     }
 }
 

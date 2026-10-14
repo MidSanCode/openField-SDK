@@ -1543,30 +1543,6 @@ impl AnnouncementList {
     }
 }
 
-/// A chunked upload session (`POST /attachments/chunk/init`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ChunkedUpload {
-    /// Upload session id, used by the per-chunk and complete calls.
-    pub upload_id: Option<String>,
-    /// Total chunks the server expects.
-    pub total_chunks: Option<i64>,
-    /// Bytes already received.
-    pub received_bytes: Option<i64>,
-    /// Unknown fields preserved verbatim.
-    #[serde(flatten)]
-    pub extra: Extra,
-}
-
-impl ChunkedUpload {
-    /// The upload id under either documented spelling.
-    pub fn id(&self) -> Option<&str> {
-        self.upload_id
-            .as_deref()
-            .or_else(|| self.extra.get("id").and_then(Value::as_str))
-    }
-}
-
 /// Server-side optional features, from the unauthenticated `GET /capabilities`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -1774,6 +1750,962 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Encode bytes as standard base64 with padding.
+///
+/// The counterpart to [`base64_decode`], used by the transports that carry binary
+/// payloads (a downloaded plugin bundle) inside the JSON envelope.
+pub fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let triple = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Money
+// ---------------------------------------------------------------------------
+
+/// A monetary amount, held as exact integer cents and rendered as decimal coins.
+///
+/// Money is the single sharpest trap in this API, because the same underlying
+/// quantity is spelled two different ways on the wire:
+///
+/// * [`Money`] (and therefore wallet balances, wallet transactions and the
+///   `wallet.adjust` amount) uses the server's `model.Cents`, whose
+///   `MarshalJSON` emits a **decimal coin** value — `Cents(1000)` becomes `10`,
+///   `Cents(1250)` becomes `12.5`. `UnmarshalJSON` accepts a number *or* a
+///   numeric string and rounds to the nearest cent.
+/// * Tips, memberships, daily make-up prices and task rewards carry a plain Go
+///   `int64`, and those are **whole coins** — `5` means five coins, not five
+///   cents. Those stay `i64` in this SDK.
+///
+/// Keeping the cent count in memory means a value such as `10.01` never degrades
+/// into `10.009999` after a round trip, which a bare `f64` would allow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Money(i64);
+
+/// Sub-units per coin, mirroring `model.MoneyScale`.
+pub const MONEY_SCALE: i64 = 100;
+
+impl Money {
+    /// Zero.
+    pub const ZERO: Self = Self(0);
+
+    /// Build from a raw cent count.
+    pub fn from_cents(cents: i64) -> Self {
+        Self(cents)
+    }
+
+    /// Build from a decimal coin amount, rounding to the nearest cent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects NaN, infinities, and anything that would overflow `i64` cents.
+    pub fn from_coins(coins: f64) -> Result<Self, crate::error::SdkError> {
+        if !coins.is_finite() {
+            return Err(crate::error::SdkError::InvalidArgument {
+                message: "invalid money amount".into(),
+            });
+        }
+        let scaled = coins * MONEY_SCALE as f64;
+        if scaled > i64::MAX as f64 || scaled < i64::MIN as f64 {
+            return Err(crate::error::SdkError::InvalidArgument {
+                message: "money amount out of range".into(),
+            });
+        }
+        Ok(Self(scaled.round() as i64))
+    }
+
+    /// The exact cent count.
+    pub fn cents(&self) -> i64 {
+        self.0
+    }
+
+    /// The value in decimal coins.
+    pub fn coins(&self) -> f64 {
+        self.0 as f64 / MONEY_SCALE as f64
+    }
+
+    /// Whether nothing is owed.
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether this is a deduction.
+    pub fn is_negative(&self) -> bool {
+        self.0 < 0
+    }
+
+    /// The negated amount.
+    pub fn negated(&self) -> Self {
+        Self(-self.0)
+    }
+}
+
+impl std::fmt::Display for Money {
+    /// Renders the decimal coin form, the way the server writes it.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 % MONEY_SCALE == 0 {
+            write!(formatter, "{}", self.0 / MONEY_SCALE)
+        } else {
+            write!(formatter, "{}", self.coins())
+        }
+    }
+}
+
+impl Serialize for Money {
+    /// Emits a decimal coin value. Whole coins stay integers (`10`, not `10.0`)
+    /// so the body reads exactly like the server's own output.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0 % MONEY_SCALE == 0 {
+            serializer.serialize_i64(self.0 / MONEY_SCALE)
+        } else {
+            serializer.serialize_f64(self.coins())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Money {
+    /// Accepts a number or a numeric string, rounding to the nearest cent.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Money;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a decimal coin amount as a number or a numeric string")
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Money, E> {
+                value
+                    .checked_mul(MONEY_SCALE)
+                    .map(Money)
+                    .ok_or_else(|| de::Error::custom("money amount out of range"))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Money, E> {
+                i64::try_from(value)
+                    .ok()
+                    .and_then(|value| value.checked_mul(MONEY_SCALE))
+                    .map(Money)
+                    .ok_or_else(|| de::Error::custom("money amount out of range"))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Money, E> {
+                Money::from_coins(value).map_err(de::Error::custom)
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Money, E> {
+                let trimmed = value.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                    return Ok(Money::ZERO);
+                }
+                trimmed
+                    .parse::<f64>()
+                    .map_err(|_| de::Error::custom(format!("invalid money amount `{value}`")))
+                    .and_then(|parsed| Money::from_coins(parsed).map_err(de::Error::custom))
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Money, E> {
+                Ok(Money::ZERO)
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Money, E> {
+                Ok(Money::ZERO)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// `GET /api/v1/wallet` — the caller's balance plus a page of transactions.
+///
+/// `balance` is a decimal coin value (see [`Money`]); the handler always adds
+/// `page` and `limit`, echoing the query it used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalletPage {
+    /// Current balance, in decimal coins on the wire.
+    pub balance: Money,
+    /// Newest-first transaction page.
+    pub transactions: Vec<WalletTransaction>,
+    /// Page number the server answered with.
+    pub page: i64,
+    /// Page size the server answered with.
+    pub limit: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One recorded balance change (`wallet_transactions`).
+///
+/// Both amounts are decimal coin values: `amount` is signed (negative for a
+/// deduction) and `balance_after` is the running balance.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalletTransaction {
+    /// Transaction id.
+    pub id: Id,
+    /// Owner of the wallet.
+    pub user_id: Id,
+    /// Signed change, in decimal coins.
+    pub amount: Money,
+    /// Balance after this change, in decimal coins.
+    pub balance_after: Money,
+    /// `recharge` | `deduct` | `post_tip` | `post_tip_income` | `makeup` | `membership` | …
+    ///
+    /// The wire field is `type`; `kind` is the Rust-side name because `type` is a
+    /// reserved word.
+    #[serde(rename = "type", deserialize_with = "de_string_or_null")]
+    pub kind: String,
+    /// Free-text note; empty when the operator supplied none.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub description: String,
+    /// The operator or counterparty that caused the change.
+    pub operator_id: Id,
+    /// RFC 3339 timestamp.
+    pub created_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `POST /api/v1/wallet/adjust` — the adjusted balance and the new transaction.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalletAdjustment {
+    /// Balance after the adjustment, in decimal coins.
+    pub balance: Money,
+    /// The transaction that was written.
+    pub transaction: WalletTransaction,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Tasks, sign-in and experience
+// ---------------------------------------------------------------------------
+
+/// One entry of the task catalog, enriched with the caller's progress.
+///
+/// The server flattens its `TaskState` (embedded `Task` plus three progress
+/// fields), so this is one flat object. `reward_currency`, `streak` and the
+/// make-up price are **whole coins** — plain Go `int64`, not `Cents`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Task {
+    /// Task id.
+    pub id: Id,
+    /// Stable code, e.g. `daily_posts_5`, `daily_login`, `daily_chat_100`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub code: String,
+    /// `once` | `streak` | `daily`. `daily` tiers reset every local day.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub kind: String,
+    /// Display name.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub name: String,
+    /// Display description.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub description: String,
+    /// Experience granted on claim.
+    pub reward_exp: i64,
+    /// Coins granted on claim.
+    pub reward_currency: i64,
+    /// Progress needed to claim.
+    pub target: i64,
+    /// Display order.
+    pub sort: i64,
+    /// Current progress toward `target`.
+    pub progress: i64,
+    /// Whether the reward has already been claimed for this cycle.
+    pub completed: bool,
+    /// Whether the reward can be claimed right now.
+    pub claimable: bool,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Task {
+    /// Whether this is one of the per-day activity tiers.
+    pub fn is_daily(&self) -> bool {
+        self.kind == "daily"
+    }
+
+    /// Progress as a `0..=1` fraction, saturating when over target.
+    pub fn ratio(&self) -> f64 {
+        if self.target <= 0 {
+            return 0.0;
+        }
+        (self.progress as f64 / self.target as f64).clamp(0.0, 1.0)
+    }
+}
+
+/// `GET /api/v1/tasks` — the catalog, the sign-in streak and the make-up price.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TaskList {
+    /// Every task, ordered by `sort` then id.
+    pub tasks: Vec<Task>,
+    /// Consecutive sign-in days.
+    pub streak: i64,
+    /// Price of one make-up sign-in, in whole coins.
+    pub makeup_cost: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl TaskList {
+    /// The tasks of one `kind`.
+    pub fn by_kind(&self, kind: &str) -> Vec<&Task> {
+        self.tasks.iter().filter(|task| task.kind == kind).collect()
+    }
+
+    /// The daily activity tiers, in catalog order.
+    pub fn daily(&self) -> Vec<&Task> {
+        self.by_kind("daily")
+    }
+
+    /// The tasks that can be claimed right now.
+    pub fn claimable(&self) -> Vec<&Task> {
+        self.tasks.iter().filter(|task| task.claimable).collect()
+    }
+
+    /// Look a task up by its code.
+    pub fn task(&self, code: &str) -> Option<&Task> {
+        self.tasks.iter().find(|task| task.code == code)
+    }
+}
+
+/// One day of the sign-in calendar.
+///
+/// `days_ago` and `before` are emitted by the handler but always left at their
+/// zero values; they are modelled so a client can rely on the shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CalendarDay {
+    /// `YYYY-MM-DD` in the configured game timezone.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub date: String,
+    /// Three-letter weekday, e.g. `Mon`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub weekday: String,
+    /// Whether the day was signed in.
+    pub signed: bool,
+    /// Whether this is the current server day.
+    pub is_today: bool,
+    /// Days before today.
+    pub days_ago: i64,
+    /// Non-reachable (future) day flag.
+    pub before: bool,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/tasks/daily-login/calendar` — the sign-in grid.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckinCalendar {
+    /// Account creation date, `YYYY-MM-DD`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub registered_at: String,
+    /// Current server day, `YYYY-MM-DD`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub today: String,
+    /// Signed dates, oldest first.
+    pub signed: Vec<String>,
+    /// Consecutive sign-in days.
+    pub streak: i64,
+    /// Make-up price, in whole coins.
+    pub makeup_cost: i64,
+    /// Experience a make-up grants.
+    pub makeup_exp: i64,
+    /// Every day from registration through today.
+    pub days: Vec<CalendarDay>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl CheckinCalendar {
+    /// Whether today is already signed in.
+    pub fn signed_today(&self) -> bool {
+        self.days.iter().any(|day| day.is_today && day.signed) || self.signed.contains(&self.today)
+    }
+
+    /// The days that were missed and can still be made up.
+    pub fn missed(&self) -> Vec<&CalendarDay> {
+        self.days
+            .iter()
+            .filter(|day| !day.signed && !day.is_today && !day.before)
+            .collect()
+    }
+}
+
+/// The result of claiming a one-time or daily task reward.
+///
+/// Both `POST /tasks/:code/claim` and `POST /tasks/daily/:code/claim` answer
+/// `{"claimed":true,"exp":N,"currency":M}`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClaimResult {
+    /// Always `true` on a 200; a failed claim is a 404 or 409 instead.
+    pub claimed: bool,
+    /// Experience granted.
+    pub exp: i64,
+    /// Coins granted.
+    pub currency: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `POST /api/v1/tasks/daily-login/claim` — today's sign-in.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DailyLoginClaim {
+    /// `false` when today was already signed in (the call is not an error).
+    pub granted: bool,
+    /// Experience granted.
+    pub exp: i64,
+    /// Coins granted.
+    pub currency: i64,
+    /// Streak after this sign-in.
+    pub streak: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `POST /api/v1/tasks/daily-login/makeup` and `.../makeup-date`.
+///
+/// A make-up renews the streak and grants experience but never the daily
+/// currency, and it charges the configured price in coins.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MakeupResult {
+    /// Whether the make-up was applied.
+    pub granted: bool,
+    /// The date that was made up, for the `makeup-date` form.
+    pub date: Option<String>,
+    /// Experience granted.
+    pub exp: i64,
+    /// Coins charged.
+    pub cost: i64,
+    /// Streak after the make-up.
+    pub streak: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One recorded experience award (`GET /api/v1/exp/history`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExpEntry {
+    /// Entry id.
+    pub id: Id,
+    /// User the experience went to.
+    pub user_id: Id,
+    /// Signed experience amount.
+    pub amount: i64,
+    /// `daily_bonus` | `makeup` | `task` | `adjust`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub reason: String,
+    /// Free-text description.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub description: String,
+    /// RFC 3339 timestamp.
+    pub created_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/exp/history` — newest-first experience history.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExpHistory {
+    /// The entries.
+    pub entries: Vec<ExpEntry>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Membership
+// ---------------------------------------------------------------------------
+
+/// One purchasable membership tier (`model.MemberTier`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemberTier {
+    /// Tier level, `1..=4`.
+    pub level: i64,
+    /// Tier name.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub name: String,
+    /// Tier description.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub description: String,
+    /// Price in **whole coins**, not cents.
+    pub price: i64,
+    /// Experience multiplier applied while the membership is active.
+    pub exp_multiplier: f64,
+    /// Days the tier lasts.
+    pub duration_days: i64,
+    /// Extra storage in MB.
+    pub storage_bonus_mb: i64,
+    /// Whether the tier may pick a second gradient colour.
+    pub allow_gradient: bool,
+    /// Whether the tier may use the animated gradient.
+    pub allow_dynamic: bool,
+    /// Fixed display-name colours available at this tier.
+    pub preset_colors: Vec<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/membership` — the caller's state plus the catalog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MembershipStatus {
+    /// Current level; `0` when the caller has never held one.
+    pub level: i64,
+    /// Name of the current tier, when it is active.
+    #[serde(default, deserialize_with = "de_string_or_null")]
+    pub name: String,
+    /// Whether the membership is currently in force.
+    pub active: bool,
+    /// RFC 3339 expiry.
+    pub expires_at: Option<String>,
+    /// Experience multiplier in force.
+    pub exp_multiplier: f64,
+    /// The purchasable catalog.
+    pub tiers: Vec<MemberTier>,
+    /// Days the current tier lasts.
+    pub member_days: i64,
+    /// Price of the next purchase, in whole coins.
+    #[serde(default)]
+    pub member_price: i64,
+    /// Whether automatic renewal is enabled.
+    pub auto_renew: bool,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `PUT /api/v1/users/:user_id/exp` — the resulting experience and level.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExpAdjustment {
+    /// Total experience after the adjustment.
+    pub exp: i64,
+    /// Level derived from `exp`.
+    pub level: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One membership purchase row (`GET /api/v1/membership/purchases`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MembershipPurchase {
+    /// Purchase id.
+    pub id: Id,
+    /// Tier level bought.
+    pub level: i64,
+    /// Tier name at the time of purchase.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub tier_name: String,
+    /// Price paid, in whole coins.
+    pub price_coins: i64,
+    /// `purchase` | `renew` | `upgrade`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub kind: String,
+    /// RFC 3339 timestamp.
+    pub created_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/membership/purchases` — a page of purchase history.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MembershipPurchaseList {
+    /// The rows.
+    pub purchases: Vec<MembershipPurchase>,
+    /// Page number.
+    pub page: i64,
+    /// Page size.
+    pub limit: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `POST /api/v1/membership/purchase` — the resulting state.
+///
+/// `paid` is in **whole coins**, while the wallet movement it caused is in cents.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PurchaseResult {
+    /// Membership state after the purchase.
+    pub status: MembershipStatus,
+    /// Coins charged.
+    pub paid: i64,
+    /// `purchase` | `renew` | `upgrade`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub kind: String,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Moderation
+// ---------------------------------------------------------------------------
+
+/// One moderation record from `user_punishments`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Punishment {
+    /// Record id.
+    pub id: Id,
+    /// The sanctioned user.
+    pub user_id: Id,
+    /// Who issued it.
+    pub operator_id: Id,
+    /// `warning` | `demerit` | `revoke` | `temp_ban` | `ban` | `unban` | `restore`.
+    ///
+    /// The wire field is `type`; `kind` is the Rust-side name because `type` is a
+    /// reserved word.
+    #[serde(rename = "type", deserialize_with = "de_string_or_null")]
+    pub kind: String,
+    /// The permission key, for `revoke` / `restore`.
+    #[serde(default, deserialize_with = "de_string_or_null")]
+    pub permission_key: String,
+    /// Free-text reason.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub reason: String,
+    /// Auto-unban deadline, for `temp_ban`.
+    pub expires_at: Option<String>,
+    /// RFC 3339 timestamp.
+    pub created_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `POST /api/v1/users/:id/punishments` — the recorded action.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PunishmentReceipt {
+    /// Id of the new `user_punishments` row.
+    pub punishment_id: Id,
+    /// The punishment type that was applied (`type` on the wire).
+    #[serde(rename = "type", deserialize_with = "de_string_or_null")]
+    pub kind: String,
+    /// Auto-unban deadline, for `temp_ban`.
+    pub expires_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/users/:id/punishments` — the history and the live bans.
+///
+/// `permission_bans` is a list of permission **keys** that are currently
+/// withheld, not a list of records.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PunishmentList {
+    /// Newest-first history.
+    pub punishments: Vec<Punishment>,
+    /// Permissions currently withheld from the user.
+    pub permission_bans: Vec<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end encryption
+// ---------------------------------------------------------------------------
+
+/// One encrypted group-key envelope.
+///
+/// The server never inspects `ciphertext`; it is whatever the client produced
+/// (`base64(AES-256-GCM(group_key))` in the reference implementation).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct E2eeKeyEnvelope {
+    /// Envelope id.
+    pub id: Id,
+    /// Conversation the key belongs to.
+    pub conversation_id: Id,
+    /// Rotation generation.
+    pub version: i64,
+    /// The member the key is encrypted for.
+    pub target_user_id: Id,
+    /// The opaque ciphertext, base64 in the reference client.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub ciphertext: String,
+    /// RFC 3339 timestamp.
+    pub created_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/conversations/:id/e2ee-keys` — every envelope plus the caller's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct E2eeKeys {
+    /// Current key generation.
+    pub version: i64,
+    /// One envelope per member the key was wrapped for.
+    pub envelopes: Vec<E2eeKeyEnvelope>,
+    /// The caller's own envelope, when one has been stored.
+    pub my_envelope: Option<E2eeKeyEnvelope>,
+    /// Conversation id.
+    pub conversation_id: Id,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `POST /api/v1/conversations/:id/e2ee-keys` — the acknowledged generation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct E2eePutResult {
+    /// Server message.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub message: String,
+    /// The generation that was written.
+    pub version: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Tips
+// ---------------------------------------------------------------------------
+
+/// One post tip (`post_tips`), as returned by `POST /posts/:id/tips`.
+///
+/// Unlike the request — which carries a whole **coin** count — these fields are
+/// the server's plain `int64` **cent** totals: a 5-coin tip records
+/// `amount = 500` and `net_amount = 475` (95 %, the 5 % platform fee removed).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostTip {
+    /// Tip id.
+    pub id: Id,
+    /// The tipped post.
+    pub post_id: Id,
+    /// The tipper.
+    pub user_id: Id,
+    /// Total paid by the tipper, in cents.
+    pub amount: i64,
+    /// The author's share, in cents.
+    pub net_amount: i64,
+    /// Refund deadline/time, when the post was deleted afterwards.
+    pub refunded_at: Option<String>,
+    /// RFC 3339 timestamp.
+    pub created_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Chunked uploads
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v1/attachments/:id/burn-arm` — the armed countdown.
+///
+/// The deadline is set the first time a user other than the uploader views the
+/// attachment; a storage sweeper then deletes both the object and the row when it
+/// passes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AttachmentBurn {
+    /// The attachment that was armed.
+    pub id: Id,
+    /// RFC 3339 deadline the countdown ends at.
+    pub burn_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `POST /api/v1/attachments/chunk/init` — the session to upload into.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChunkSession {
+    /// Opaque session id used by every later chunk call.
+    #[serde(default, deserialize_with = "de_string_or_null")]
+    pub upload_id: String,
+    /// How many parts the caller must upload.
+    pub total_chunks: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/attachments/chunk/:upload_id` — a resume map.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChunkStatus {
+    /// The session id.
+    #[serde(default, deserialize_with = "de_string_or_null")]
+    pub upload_id: String,
+    /// 1-based indexes already stored, ascending.
+    pub uploaded: Vec<i64>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl ChunkStatus {
+    /// Whether a given 1-based index is already stored.
+    pub fn has(&self, index: i64) -> bool {
+        self.uploaded.contains(&index)
+    }
+
+    /// The 1-based indexes that still have to be sent.
+    pub fn missing(&self, total_chunks: i64) -> Vec<i64> {
+        (1..=total_chunks)
+            .filter(|index| !self.uploaded.contains(index))
+            .collect()
+    }
+}
+
+/// `POST /api/v1/attachments/chunk/:upload_id/:index` — one stored part.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChunkReceipt {
+    /// The session id.
+    #[serde(default, deserialize_with = "de_string_or_null")]
+    pub upload_id: String,
+    /// The 1-based index that was stored.
+    pub index: i64,
+    /// Bytes accepted.
+    pub size: i64,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Plugins (store)
+// ---------------------------------------------------------------------------
+
+/// One plugin-store catalog row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Plugin {
+    /// Plugin id, `^[a-z0-9][a-z0-9._-]{2,63}$`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub id: String,
+    /// Display name.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub name: String,
+    /// Semantic version.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub version: String,
+    /// Author.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub author: String,
+    /// Description.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub description: String,
+    /// Permission keys the bundle declares.
+    pub permissions: Vec<String>,
+    /// Minimum app version.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub min_app_version: String,
+    /// Whether the store badges the plugin as verified.
+    pub verified: bool,
+    /// Whether the plugin is listed publicly.
+    pub published: bool,
+    /// Download counter.
+    pub downloads: i64,
+    /// Bundle size in bytes.
+    pub file_size: i64,
+    /// SHA-256 of the bundle, lowercase hex.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub sha256: String,
+    /// RFC 3339 creation timestamp.
+    pub created_at: Option<String>,
+    /// RFC 3339 last-update timestamp.
+    pub updated_at: Option<String>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `GET /api/v1/plugins` — the published catalog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginList {
+    /// Published plugins, newest update first.
+    pub plugins: Vec<Plugin>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl PluginList {
+    /// Look a plugin up by id.
+    pub fn plugin(&self, id: &str) -> Option<&Plugin> {
+        self.plugins.iter().find(|plugin| plugin.id == id)
+    }
+}
+
+/// `POST /api/v1/plugins/admin/upload` — the stored catalog row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUpload {
+    /// Server message, `uploaded`.
+    #[serde(deserialize_with = "de_string_or_null")]
+    pub message: String,
+    /// The catalog row that was written.
+    pub plugin: Option<Plugin>,
+    /// Unknown fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[cfg(test)]

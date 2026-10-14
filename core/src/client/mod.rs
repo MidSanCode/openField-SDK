@@ -18,10 +18,16 @@ pub mod any;
 pub mod bots;
 pub mod camps;
 pub mod chat;
+pub mod e2ee;
+pub mod membership;
 pub mod misc;
+pub mod moderation;
+pub mod plugins;
 pub mod posts;
 pub mod request;
 pub mod storage;
+pub mod tasks;
+pub mod wallet;
 
 pub use any::AnyClient;
 pub use request::{Request, RequestBody};
