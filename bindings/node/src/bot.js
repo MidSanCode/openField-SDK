@@ -15,6 +15,9 @@
  *   replay them, so {@link Bot#watch} polls as well as subscribes.
  */
 
+import { readFileSync, writeFileSync } from 'node:fs';
+import { basename } from 'node:path';
+
 import { InvalidArgumentError, UnauthorizedError, BotError } from './errors.js';
 import { SidecarTransport } from './sidecar.js';
 
@@ -26,6 +29,23 @@ export const VISIBILITIES = ['public', 'login', 'friends', 'private'];
 
 /** The report target kinds the server accepts. */
 export const REPORT_TARGETS = ['post', 'message', 'user'];
+
+/** The punishment types the server accepts (`model.PunishmentType`). */
+export const PUNISHMENT_TYPES = [
+  'warning',
+  'demerit',
+  'revoke',
+  'temp_ban',
+  'ban',
+  'unban',
+  'restore',
+];
+
+/** Largest plugin bundle the service accepts (5 MiB). */
+export const MAX_BUNDLE_BYTES = 5 * 1024 * 1024;
+
+/** Longest burn-after-view countdown the handler's binding allows. */
+export const MAX_BURN_SECONDS = 86400;
 
 /** One realtime event, with accessors for the envelope's three fields. */
 export class Event {
@@ -61,6 +81,12 @@ export class Event {
 
 /** An OpenField bot client. */
 export class Bot {
+  /** Largest single chunk the server accepts (8 MiB). */
+  static CHUNK_BYTES = 8 * 1024 * 1024;
+
+  /** Largest number of chunks per session. */
+  static MAX_CHUNKS = 10000;
+
   /**
    * @param {string} [baseUrl] The instance root, e.g. `https://openfield.example.com`.
    * @param {string} [token] The bot token: `ofb_` plus 64 lowercase hex characters.
@@ -575,6 +601,529 @@ export class Bot {
     return this.call('storage.delete', { attachment_id: attachmentId });
   }
 
+  /** Fetch one attachment record by id. */
+  attachment(attachmentId) {
+    return this.call('storage.attachment', { attachment_id: attachmentId });
+  }
+
+  /**
+   * Look an attachment up by the lowercase hex SHA-256 of its bytes, so an upload the cloud
+   * already holds does not have to be repeated.
+   *
+   * Deduplication is **per user**, so this only finds blobs this bot uploaded.
+   */
+  attachmentByHash(hexDigest) {
+    return this.call('storage.by_hash', { hash: requireSha256(hexDigest) });
+  }
+
+  /**
+   * Arm a burn-after-view countdown of at most 24 hours.
+   *
+   * The deadline starts on the **first view by someone else**; the uploader can never
+   * trigger it, and for the uploader the server answers 404 exactly as for an unknown id.
+   */
+  armAttachmentBurn(attachmentId, burnSeconds) {
+    const seconds = requireInt('burn_seconds', burnSeconds);
+    if (seconds < 1 || seconds > 86400) {
+      throw new InvalidArgumentError(`burn_seconds must be 1..86400, got ${seconds}`);
+    }
+    return this.call('storage.burn_arm', {
+      attachment_id: attachmentId,
+      burn_seconds: seconds,
+    });
+  }
+
+  // -- chunked uploads ----------------------------------------------------
+
+  /**
+   * Open a resumable upload session.
+   *
+   * @param {string} filename
+   * @param {number} size Total byte length.
+   * @param {number} totalChunks At most {@link Bot.MAX_CHUNKS}.
+   * @returns {Promise<{upload_id: string, total_chunks: number}>}
+   */
+  startChunkedUpload(filename, size, totalChunks, { mimeType, visibility } = {}) {
+    const upload = chunkLayout(filename, size, totalChunks, mimeType, visibility);
+    return this.call('storage.chunk_init', { upload });
+  }
+
+  /** Which 1-based chunk indexes already landed, for a resume. */
+  chunkStatus(uploadId) {
+    return this.call('storage.chunk_status', { upload_id: uploadId });
+  }
+
+  /**
+   * Store one chunk. Indexes are 1-based and the multipart field is `chunk`.
+   *
+   * @param {string} uploadId
+   * @param {number} index
+   * @param {Buffer|Uint8Array} data At most {@link Bot.CHUNK_BYTES}.
+   */
+  uploadChunk(uploadId, index, data) {
+    const number = requireInt('index', index);
+    if (number < 1) {
+      throw new InvalidArgumentError(`chunk index is 1-based, got ${number}`);
+    }
+    if (data.length > Bot.CHUNK_BYTES) {
+      throw new InvalidArgumentError(
+        `chunk is ${data.length} bytes, above the ${Bot.CHUNK_BYTES} byte limit`,
+      );
+    }
+    const part = {
+      upload_id: uploadId,
+      index: number,
+      bytes: Buffer.from(data).toString('base64'),
+    };
+    return this.call('storage.chunk_upload', { part });
+  }
+
+  /** Assemble the stored chunks into an attachment. */
+  completeChunkedUpload(uploadId, filename, size, totalChunks, { mimeType, visibility } = {}) {
+    const upload = chunkLayout(filename, size, totalChunks, mimeType, visibility);
+    return this.call('storage.chunk_complete', { upload_id: uploadId, upload });
+  }
+
+  /**
+   * Upload a large payload through the chunked path, resuming if asked.
+   *
+   * @param {string} fileName
+   * @param {Buffer|Uint8Array} data The whole payload.
+   * @param {object} [options]
+   * @param {number} [options.chunkBytes] Part size; defaults to {@link Bot.CHUNK_BYTES}.
+   * @param {string} [options.uploadId] Continue an open session, re-sending only what the
+   *   server is missing.
+   */
+  async uploadChunked(fileName, data, { chunkBytes, uploadId, mimeType, visibility } = {}) {
+    const buffer = Buffer.from(data);
+    if (buffer.length === 0) throw new InvalidArgumentError('nothing to upload');
+    const size = Math.min(Math.max(1, chunkBytes ?? Bot.CHUNK_BYTES), Bot.CHUNK_BYTES);
+    const parts = [];
+    for (let offset = 0; offset < buffer.length; offset += size) {
+      parts.push(buffer.subarray(offset, offset + size));
+    }
+    const upload = chunkLayout(
+      fileName,
+      buffer.length,
+      parts.length,
+      mimeType,
+      visibility,
+    );
+    let sessionId = uploadId;
+    if (sessionId === undefined) {
+      const session = await this.call('storage.chunk_init', { upload });
+      sessionId = session.upload_id;
+    }
+    // Resume: only the parts the server does not already hold are sent.
+    const status = await this.call('storage.chunk_status', { upload_id: sessionId });
+    const stored = new Set(status.uploaded ?? []);
+    for (const [offset, part] of parts.entries()) {
+      const index = offset + 1;
+      if (!stored.has(index)) await this.uploadChunk(sessionId, index, part);
+    }
+    return this.call('storage.chunk_complete', { upload_id: sessionId, upload });
+  }
+
+  // -- wallet -------------------------------------------------------------
+
+  /**
+   * This bot's balance and a page of its transactions.
+   *
+   * Amounts are **decimal coins**, the shape the server's `model.Cents` puts on the wire:
+   * `10` is ten coins, `12.5` is twelve and a half. Keep cents in your own arithmetic if
+   * you need exactness.
+   */
+  wallet({ page, limit } = {}) {
+    return this.call('wallet.get', compact({ page, limit }));
+  }
+
+  /**
+   * Credit `amount` coins to a user. Needs `wallet.manage`, which the default group holds —
+   * so any authenticated bot can currently move any balance.
+   */
+  rechargeWallet(userId, amount, { description } = {}) {
+    return this.call(
+      'wallet.recharge',
+      compact({
+        user_id: requireInt('user_id', userId),
+        amount: requireAmount('amount', amount),
+        description,
+      }),
+    );
+  }
+
+  /**
+   * Debit `amount` coins from a user. Needs `wallet.manage`.
+   *
+   * The sign is handled here: the server stores the amount verbatim and never checks it
+   * against the transaction type, so a positive value would silently become a credit.
+   */
+  deductWallet(userId, amount, { description } = {}) {
+    return this.call(
+      'wallet.deduct',
+      compact({
+        user_id: requireInt('user_id', userId),
+        amount: requireAmount('amount', amount),
+        description,
+      }),
+    );
+  }
+
+  /**
+   * Apply a signed balance change, exactly as the wire takes it.
+   *
+   * @param {number} userId
+   * @param {number} amount **Signed** decimal coins: positive credits, negative debits.
+   * @param {object} [options]
+   * @param {string} [options.type] `recharge` or `deduct`. It is recorded as a label and
+   *   is **not** reconciled with the sign, so a positive amount with `type: 'deduct'` is
+   *   a credit.
+   * @param {string} [options.description]
+   */
+  adjustWallet(userId, amount, { type, description } = {}) {
+    return this.call(
+      'wallet.adjust',
+      compact({
+        user_id: requireInt('user_id', userId),
+        amount: requireAmount('amount', amount),
+        type,
+        description,
+      }),
+    );
+  }
+
+  // -- tasks, sign-in and experience -------------------------------------
+
+  /**
+   * The task catalog with this bot's progress, streak and make-up price.
+   *
+   * Currency figures here are **whole coins**, unlike the wallet's decimal coins.
+   */
+  tasks() {
+    return this.call('tasks.list');
+  }
+
+  /** Claim a one-time or streak task. */
+  claimTask(code) {
+    return this.call('tasks.claim', { code });
+  }
+
+  /** Claim one of today's activity tiers; each is once per local day. */
+  claimDailyTask(code) {
+    return this.call('tasks.claim_daily', { code });
+  }
+
+  /**
+   * Sign in for today.
+   *
+   * A second call is not an error: it answers `{granted: false}`.
+   */
+  claimDailyLogin() {
+    return this.call('tasks.login_claim');
+  }
+
+  /** The sign-in grid: `registered_at`, `today`, `signed`, `days`, and so on. */
+  checkinCalendar() {
+    return this.call('tasks.login_calendar');
+  }
+
+  /**
+   * Pay to make up the most recent missed sign-in.
+   *
+   * A make-up renews the streak and grants experience but never the daily currency.
+   */
+  makeupCheckin() {
+    return this.call('tasks.makeup');
+  }
+
+  /**
+   * Pay to sign in one specific missed day.
+   *
+   * @param {string} date `YYYY-MM-DD`, in the game's configured timezone.
+   */
+  makeupCheckinOn(date) {
+    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      throw new InvalidArgumentError(`date must be \`YYYY-MM-DD\`, got ${String(date)}`);
+    }
+    return this.call('tasks.makeup_date', { date });
+  }
+
+  /** Newest-first experience awards. */
+  expHistory({ limit } = {}) {
+    return this.call('tasks.exp_history', compact({ limit }));
+  }
+
+  // -- membership and the payment PIN ------------------------------------
+
+  /** This bot's membership state plus the purchasable catalog. */
+  membership() {
+    return this.call('membership.get');
+  }
+
+  /**
+   * Buy a membership tier with wallet coins, authorized by the payment PIN.
+   *
+   * A fresh bot has no PIN, so this answers 403 until {@link Bot#setPaymentPin} is called.
+   */
+  purchaseMembership(level, pin) {
+    const tier = requireInt('level', level);
+    if (tier < 1 || tier > 4) {
+      throw new InvalidArgumentError(`membership level must be 1..4, got ${tier}`);
+    }
+    if (!pin) throw new InvalidArgumentError('pin must not be empty');
+    return this.call('membership.purchase', { level: tier, pin });
+  }
+
+  /**
+   * Toggle automatic renewal.
+   *
+   * Enabling pre-authorizes future charges and needs `pin`; disabling needs only the token.
+   */
+  setAutoRenew(enabled, { pin } = {}) {
+    const options = { enabled: Boolean(enabled) };
+    if (pin !== undefined) options.pin = pin;
+    else if (enabled) {
+      throw new InvalidArgumentError('enabling auto-renew needs the payment pin');
+    }
+    return this.call('membership.auto_renew', options);
+  }
+
+  /** This bot's membership purchase history. */
+  membershipPurchases({ page, limit } = {}) {
+    return this.call('membership.purchases', compact({ page, limit }));
+  }
+
+  /**
+   * Grant a membership directly, skipping the wallet. Needs `user.membership.grant`.
+   *
+   * `level: 0` clears the membership.
+   */
+  grantMembership(userId, level, { days } = {}) {
+    return this.call(
+      'membership.grant',
+      compact({
+        user_id: requireInt('user_id', userId),
+        level: requireInt('level', level),
+        days: days === undefined ? undefined : requireInt('days', days),
+      }),
+    );
+  }
+
+  /**
+   * Adjust a user's experience. Needs `user.adjust_exp`.
+   *
+   * `delta` is signed and the field is named `delta`, not `amount`. A positive delta is
+   * multiplied by the target's membership multiplier before it is applied.
+   */
+  adjustExp(userId, delta, { description } = {}) {
+    return this.call(
+      'membership.exp_adjust',
+      compact({
+        user_id: requireInt('user_id', userId),
+        delta: requireInt('delta', delta),
+        description,
+      }),
+    );
+  }
+
+  /**
+   * Set the six-digit payment PIN.
+   *
+   * Every outgoing payment — tips, memberships and transfers — is authorized by this PIN,
+   * and a freshly created bot has none, so this is what a spending bot must call first.
+   * Replacing an existing PIN requires `oldPin`.
+   */
+  setPaymentPin(pin, { oldPin } = {}) {
+    requirePin(pin);
+    return this.call('account.pin_set', compact({ pin, old_pin: oldPin }));
+  }
+
+  /** Replace the payment PIN, presenting the current one. */
+  changePaymentPin(oldPin, pin) {
+    requirePin(pin);
+    if (!oldPin) throw new InvalidArgumentError('old_pin must not be empty');
+    return this.call('account.pin_change', { old_pin: oldPin, pin });
+  }
+
+  /**
+   * Check a PIN without spending anything.
+   *
+   * A wrong PIN is **counted** against the same five-failure budget that tips and
+   * memberships use, so probing this can lock payments out for fifteen minutes.
+   *
+   * @returns {Promise<boolean>}
+   */
+  async verifyPaymentPin(pin) {
+    if (!pin) throw new InvalidArgumentError('pin must not be empty');
+    const answer = await this.call('account.pin_verify', { pin });
+    return Boolean(answer.valid);
+  }
+
+  // -- moderation ---------------------------------------------------------
+
+  /**
+   * Record a moderation action. Needs `user.punish`, which the default group lacks.
+   *
+   * @param {number} userId The sanctioned user. Not yourself: that is a 403.
+   * @param {string} type One of {@link PUNISHMENT_TYPES}.
+   * @param {object} [options]
+   * @param {string} [options.reason]
+   * @param {string} [options.permissionKey] Required for `revoke` and `restore`.
+   * @param {number} [options.durationMinutes] Required for `temp_ban`.
+   */
+  punish(userId, type, { reason, permissionKey, durationMinutes } = {}) {
+    if (!PUNISHMENT_TYPES.includes(type)) {
+      throw new InvalidArgumentError(
+        `unknown punishment type ${type}; expected one of ${PUNISHMENT_TYPES.join(', ')}`,
+      );
+    }
+    if ((type === 'revoke' || type === 'restore') && !permissionKey) {
+      throw new InvalidArgumentError(`${type} requires permission_key`);
+    }
+    if (type === 'temp_ban' && !durationMinutes) {
+      throw new InvalidArgumentError('temp_ban requires a positive duration_minutes');
+    }
+    const punishment = compact({
+      type,
+      reason,
+      permission_key: permissionKey,
+      duration_minutes:
+        durationMinutes === undefined ? undefined : requireInt('duration_minutes', durationMinutes),
+    });
+    return this.call('moderation.punish', { user_id: userId, punishment });
+  }
+
+  /**
+   * A user's moderation history plus the permissions currently withheld.
+   *
+   * `permission_bans` is a list of permission **keys**, not records.
+   */
+  punishments(userId, { limit } = {}) {
+    return this.call(
+      'moderation.punishments',
+      compact({ user_id: requireInt('user_id', userId), limit }),
+    );
+  }
+
+  // -- end-to-end encryption ---------------------------------------------
+
+  /** Publish this bot's E2EE public key. An empty string clears it. */
+  setE2eePublicKey(publicKey) {
+    return this.call('e2ee.set_key', { public_key: publicKey });
+  }
+
+  /** Every group-key envelope plus this bot's own, for one conversation. */
+  e2eeKeys(conversationId) {
+    return this.call('e2ee.keys', { conversation_id: conversationId });
+  }
+
+  /**
+   * Store a rotated batch of group-key envelopes.
+   *
+   * @param {number} conversationId The group; the caller must be a member.
+   * @param {object|Map<number, string>} envelopes `{targetUserId: ciphertext}`. The server
+   *   relays the ciphertext untouched and refuses an empty batch. Go binds
+   *   `map[int64]string`, so the ids are JSON object keys.
+   */
+  putE2eeKeys(conversationId, envelopes) {
+    const pairs = envelopes instanceof Map ? [...envelopes.entries()] : Object.entries(envelopes);
+    if (pairs.length === 0) {
+      throw new InvalidArgumentError('at least one envelope is required');
+    }
+    const batch = {};
+    for (const [userId, ciphertext] of pairs) batch[String(userId)] = ciphertext;
+    return this.call('e2ee.put_keys', { conversation_id: conversationId, envelopes: batch });
+  }
+
+  // -- plugin store -------------------------------------------------------
+
+  /** The published plugin catalog. Public: no token is required. */
+  plugins() {
+    return this.call('plugins.list');
+  }
+
+  /** One published plugin by id. Absent and unpublished both answer 404. */
+  plugin(pluginId) {
+    return this.call('plugins.get', { plugin_id: requirePluginId(pluginId) });
+  }
+
+  /**
+   * Download a bundle. Requires a token, and increments the download counter.
+   *
+   * @returns {Promise<Buffer>}
+   */
+  async downloadPlugin(pluginId) {
+    const answer = await this.call('plugins.download', {
+      plugin_id: requirePluginId(pluginId),
+    });
+    return Buffer.from(answer.bytes, 'base64');
+  }
+
+  /** Download a bundle and write it to `path`. Returns the byte count. */
+  async downloadPluginTo(pluginId, path) {
+    const data = await this.downloadPlugin(pluginId);
+    writeFileSync(path, data);
+    return data.length;
+  }
+
+  /**
+   * Upload a bundle. Needs `plugin.manage`.
+   *
+   * The service caps bundles at 5 MiB and requires a `manifest.json` at the zip root with a
+   * valid id and semantic version.
+   */
+  uploadPlugin(fileName, data, { publish = false } = {}) {
+    if (data.length > MAX_BUNDLE_BYTES) {
+      throw new InvalidArgumentError(
+        `bundle is ${data.length} bytes, above the ${MAX_BUNDLE_BYTES} byte service limit`,
+      );
+    }
+    const upload = {
+      file_name: fileName,
+      bytes: Buffer.from(data).toString('base64'),
+      mime: 'application/zip',
+    };
+    return this.call('plugins.upload', { upload, publish: Boolean(publish) });
+  }
+
+  /** Upload a bundle read from disk. */
+  uploadPluginFile(path, options = {}) {
+    return this.uploadPlugin(basename(path), readFileSync(path), options);
+  }
+
+  /** List a plugin on the store. */
+  publishPlugin(pluginId) {
+    return this.call('plugins.publish', { plugin_id: requirePluginId(pluginId) });
+  }
+
+  /** Hide a plugin from the store, keeping the row and the bundle. */
+  unpublishPlugin(pluginId) {
+    return this.call('plugins.unpublish', { plugin_id: requirePluginId(pluginId) });
+  }
+
+  /** Delete a plugin row and its bundle. */
+  deletePlugin(pluginId) {
+    return this.call('plugins.delete', { plugin_id: requirePluginId(pluginId) });
+  }
+
+  // -- tips ---------------------------------------------------------------
+
+  /**
+   * Tip a post with coins, authorized by the payment PIN.
+   *
+   * `amount` is a whole **coin** count (1..100000), not the wallet's decimal coins. The
+   * response reports cents: a 5-coin tip records `amount: 500` and `net_amount: 475`, the
+   * 5 % platform fee having been taken. A deleted post refunds the tipper.
+   */
+  tipPost(postId, amount, pin) {
+    const coins = requireInt('amount', amount);
+    if (coins < 1 || coins > 100000) {
+      throw new InvalidArgumentError(`tip amount must be 1..100000 coins, got ${coins}`);
+    }
+    if (!pin) throw new InvalidArgumentError('pin must not be empty');
+    return this.call('posts.tip', { post_id: postId, amount: coins, pin });
+  }
+
   // -- moderation, notifications, instance -------------------------------
 
   /**
@@ -899,4 +1448,87 @@ function compact(object) {
     if (value !== undefined && value !== null) result[key] = value;
   }
   return result;
+}
+
+/**
+ * Coerce an integer field, refusing the shapes Go's decoder would refuse.
+ *
+ * A non-integer number is rejected because Go will not decode `5.0` into an `int64`, and a
+ * string is rejected because the caller should have passed a number.
+ */
+function requireInt(name, value) {
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new InvalidArgumentError(`${name} must be an integer, got ${String(value)}`);
+  }
+  return value;
+}
+
+/** Accept a monetary amount in decimal coins: any finite number. */
+function requireAmount(name, value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new InvalidArgumentError(`${name} must be a number of coins, got ${String(value)}`);
+  }
+  return value;
+}
+
+/** A payment PIN is exactly six digits (`security.ValidPin`). */
+function requirePin(pin) {
+  if (typeof pin !== 'string' || !/^\d{6}$/.test(pin)) {
+    throw new InvalidArgumentError('the payment pin must be exactly 6 digits');
+  }
+  return pin;
+}
+
+/** Normalise a SHA-256 digest to the lowercase 64-character hex the server looks up. */
+function requireSha256(hexDigest) {
+  const digest = typeof hexDigest === 'string' ? hexDigest.trim().toLowerCase() : '';
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    throw new InvalidArgumentError('hash must be 64 hexadecimal characters (SHA-256)');
+  }
+  return digest;
+}
+
+/**
+ * Reject a plugin id the service would reject, and never let one act as a path.
+ *
+ * `.` and `..` satisfy the id grammar, so they are excluded by name.
+ */
+function requirePluginId(pluginId) {
+  const candidate = typeof pluginId === 'string' ? pluginId.trim() : '';
+  if (!/^[a-z0-9][a-z0-9._-]{2,63}$/.test(candidate) || candidate === '.' || candidate === '..') {
+    throw new InvalidArgumentError(
+      `plugin id ${JSON.stringify(pluginId)} must match ^[a-z0-9][a-z0-9._-]{2,63}$`,
+    );
+  }
+  return candidate;
+}
+
+/** Build and check the `chunk/init` and `chunk/complete` body, which share one shape. */
+function chunkLayout(filename, size, totalChunks, mimeType, visibility) {
+  if (typeof filename !== 'string' || filename.trim() === '') {
+    throw new InvalidArgumentError('filename is required');
+  }
+  const bytes = requireInt('size', size);
+  const chunks = requireInt('total_chunks', totalChunks);
+  if (bytes <= 0) throw new InvalidArgumentError(`size must be positive, got ${bytes}`);
+  if (chunks <= 0) {
+    throw new InvalidArgumentError(`total_chunks must be positive, got ${chunks}`);
+  }
+  if (chunks > Bot.MAX_CHUNKS) {
+    throw new InvalidArgumentError(
+      `total_chunks must be at most ${Bot.MAX_CHUNKS}, got ${chunks}`,
+    );
+  }
+  if (bytes > chunks * Bot.CHUNK_BYTES) {
+    throw new InvalidArgumentError(
+      `declared size ${bytes} exceeds what ${chunks} chunks can carry`,
+    );
+  }
+  return compact({
+    filename,
+    size: bytes,
+    total_chunks: chunks,
+    mime_type: mimeType,
+    visibility,
+  });
 }

@@ -79,6 +79,11 @@ export class Testkit {
     return (await this.requests()).filter((entry) => entry.path === path);
   }
 
+  /** Drop the recorded request log, so a test can assert on one action alone. */
+  async clearRequests() {
+    await this.testkit('testkit.clear_requests');
+  }
+
   async broadcast(event) {
     const result = await this.testkit('testkit.broadcast', { event });
     return result.delivered;
