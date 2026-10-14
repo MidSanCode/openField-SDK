@@ -45,17 +45,27 @@ if let Some(conflict) = divergence("message list ordering") {
 }
 ```
 
-The three with the widest blast radius:
+The widest blast radius, in order:
 
 1. **Message ordering.** `bots.md` §7.3 says conversation history is ascending, so the newest
    is `messages[-1]`. The handler sorts `ORDER BY m.created_at DESC, m.id DESC` — newest
    first — and the Go comment right above that SQL still says "(newest last)", so the server's
    own comment disagrees with its own query. `chat.messages` returns **newest first**.
-2. **Content limits are bytes, nicknames are runes.** `len(req.Content) > 5000` counts bytes;
+2. **Money units.** `wallet.md` presents wallet amounts as integer cents and tells the client
+   to divide by 100. The server's `model.Cents` marshals `cents / 100` instead, so the wire
+   carries **decimal coins**: the documented `10000` is what the server writes as `100`.
+   Reading it the documented way is wrong by a factor of 100. The same note also claims money
+   never moves between users, which `post_tips` and `POST /transfers` contradict.
+3. **Content limits are bytes, nicknames are runes.** `len(req.Content) > 5000` counts bytes;
    `len([]rune(nickname)) > 100` counts code points. A Japanese post can be well under 5000
    characters and still be refused; the SDK mirrors both units rather than picking one.
-3. **`/api/v1/health` is rate-limited.** `features.md` implies it is outside the limiter; it
+4. **`/api/v1/health` is rate-limited.** `features.md` implies it is outside the limiter; it
    is registered after `r.Use`, so it is inside. A monitor polling it can be throttled.
+5. **The sign-in surface is bigger than documented.** `daily-tasks.md` lists two task routes;
+   the gateway carries eight, including the whole daily-login calendar and paid make-up
+   family. Their unusual spelling split — the route is `daily-login`, the task code is
+   `daily_login` — is a live trap, because posting the code to the route quietly reaches the
+   generic `:code` claim instead.
 
 `bots.md` is the primary reference for bot behaviour — permissions, quotas, the
 never-reply-to-yourself rule, and the ban-avoidance guidance in its sections 15 and 16 are

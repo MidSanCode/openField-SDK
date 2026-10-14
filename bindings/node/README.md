@@ -93,5 +93,16 @@ cd bindings/node && node --test test/
 - `messages()` returns messages **newest first**. The bundled `bots.md` §7.3 says otherwise;
   the server's SQL disagrees with the docs, and the SDK follows the SQL.
 - Content limits are counted in **bytes**, while a bot nickname is counted in **runes**.
+- **Money is spelled two ways.** `wallet()`, `rechargeWallet()` and `deductWallet()` speak
+  **decimal coins** — `10` is ten coins, `12.5` is twelve and a half — because the server's
+  `model.Cents` puts that on the wire. `tipPost()`, membership prices and task rewards are
+  **whole coins**, so the facades refuse a fractional value there rather than send a `400`.
+- A spending bot needs a payment PIN first: `setPaymentPin('123456')`. Until then every
+  payment endpoint answers `403 payment pin not set`. Five wrong attempts lock payments for
+  fifteen minutes.
+- `uploadChunked()` resumes rather than restarts: pass the previous `uploadId` and only the
+  parts the server is missing are re-sent.
+- `downloadPlugin()` resolves to a `Buffer`; the transport carries it as base64 because the
+  JSON envelope has no bytes.
 - The event channel is best-effort and does not replay across a disconnect, so reconcile
   anything durable by polling.

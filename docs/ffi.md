@@ -110,6 +110,10 @@ may need to keep serving until the swap completes.
 `params_json` may be `NULL` or `"null"` for a method that takes none. Ask for
 `capabilities` to list every method.
 
+A method whose result is **binary** still answers JSON: `plugins.download` returns
+`{"size":…,"bytes":"<base64>"}`, because this transport carries strings and not buffers.
+Decode `bytes` yourself; the sidecar behaves the same way.
+
 The event methods are **not** usable through `ofbot_call`: this transport has no event sink,
 so `events.subscribe` answers an error saying so rather than starting a subscription nobody
 can read. Use `ofbot_events_*`.

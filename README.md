@@ -113,7 +113,7 @@ categories, the same event objects. Only the spelling changes.
 
 ## The method surface
 
-87 methods, all listed by `capabilities`:
+142 methods, all listed by `capabilities`:
 
 ```bash
 echo '{"id":1,"method":"capabilities"}' | ./target/debug/openfield-bot-sidecar
@@ -124,18 +124,42 @@ echo '{"id":1,"method":"capabilities"}' | ./target/debug/openfield-bot-sidecar
 | Meta | `version`, `ping`, `capabilities` |
 | Client | `client.init`, `client.set_token`, `client.config`, `client.has_token` |
 | Escape hatch | `request` — any `/api/v1/…` path |
-| Account | `me`, `permissions`, `startup_check`, `update_profile`, `user`, `follow`, `storage_usage`, `upload_avatar`, `health`, `announcements` |
+| Account | `me`, `permissions`, `startup_check`, `update_profile`, `user`, `follow`, `storage_usage`, `upload_avatar`, `health`, `announcements`, `account.pin_set`, `account.pin_change`, `account.pin_verify` |
 | Bots | `bots.create`, `bots.list`, `bots.regenerate`, `bots.delete` |
-| Posts | `posts.create`, `posts.list`, `posts.search`, `posts.get`, `posts.update`, `posts.delete`, `posts.pin`, `posts.react`, `posts.unreact`, `posts.favorite`, `posts.reply`, `posts.replies` |
+| Posts | `posts.create`, `posts.list`, `posts.search`, `posts.get`, `posts.update`, `posts.delete`, `posts.pin`, `posts.react`, `posts.unreact`, `posts.favorite`, `posts.reply`, `posts.replies`, `posts.tip` |
 | Chat | `chat.conversations`, `chat.create`, `chat.get`, `chat.messages`, `chat.latest`, `chat.search`, `chat.send`, `chat.edit`, `chat.delete`, `chat.read`, `chat.typing`, `chat.join`, `chat.invite`, `chat.leave`, `chat.start`, `chat.consent_requests`, `chat.files` |
 | Camps | `camps.list`, `camps.get`, `camps.create`, `camps.update`, `camps.delete`, `camps.posts`, `camps.join`, `camps.leave`, `camps.members`, `camps.subgroups` |
-| Storage | `storage.upload`, `storage.upload_many`, `storage.list`, `storage.delete` |
-| Moderation | `reports.create`, `reports.mine` |
+| Storage | `storage.upload`, `storage.upload_many`, `storage.list`, `storage.delete`, `storage.attachment`, `storage.by_hash`, `storage.burn_arm`, `storage.chunk_init`, `storage.chunk_upload`, `storage.chunk_status`, `storage.chunk_complete`, `storage.chunked` |
+| Wallet | `wallet.get`, `wallet.adjust`, `wallet.recharge`, `wallet.deduct` |
+| Tasks | `tasks.list`, `tasks.claim`, `tasks.claim_daily`, `tasks.login_claim`, `tasks.login_calendar`, `tasks.makeup`, `tasks.makeup_date`, `tasks.exp_history` |
+| Membership | `membership.get`, `membership.purchase`, `membership.auto_renew`, `membership.purchases`, `membership.grant`, `membership.exp_adjust` |
+| Moderation | `reports.create`, `reports.mine`, `moderation.punish`, `moderation.punishments` |
+| E2EE | `e2ee.set_key`, `e2ee.keys`, `e2ee.put_keys` |
+| Plugin store | `plugins.list`, `plugins.get`, `plugins.download`, `plugins.upload`, `plugins.publish`, `plugins.unpublish`, `plugins.delete` |
 | Notifications | `notifications.list`, `notifications.read` |
 | Events | `events.subscribe`, `events.unsubscribe`, `events.stats` |
 
 `docs/protocol.md` documents every payload. Anything the table does not name is still
 reachable through `request`, because the escape hatch takes any server-relative path.
+
+### What is *not* wrapped
+
+The escape hatch is the boundary, so it is worth saying where it still applies. These are
+**not** typed wrappers:
+
+- the user-to-user transfer flow (`/transfers`, `.../accept`, `.../decline`) and red-packet
+  checks (`/checks`, `.../claim`);
+- the auth surface — login, refresh, registration, OIDC, QR sign-in and session management.
+  A bot authenticates with its static `ofb_` token, so none of it applies;
+- profile extras: `locale`, `privacy`, `name-style`, `heartbeat`, `deletion-request`,
+  `claim-daily-bonus`, and banner upload;
+- follower/following/friends lists, announcement administration, and the conversation
+  announcement/todo mutations;
+- forwarding messages, and camp member role/kick/pin administration.
+
+Several of these **are** already implemented in the Rust client but not exposed by the
+method table, so the bindings cannot reach them; that gap is tracked separately from the
+typed wrappers above.
 
 ## What the SDK handles for you
 
@@ -184,6 +208,13 @@ Two more worth knowing:
   post can be far fewer than 5000 characters and still be rejected.
 - `/api/v1/health` **is** inside the rate limiter (it is registered after `r.Use`), contrary
   to `features.md`.
+- **Money is spelled two ways.** Wallet balances, wallet transactions and `wallet.adjust`
+  carry the server's `model.Cents`, which puts a **decimal coin** value on the wire: `10`
+  is ten coins (1000 cents) and `12.5` is twelve and a half. Tips, membership prices, task
+  rewards and make-up prices carry a plain Go `int64` and are **whole coins**. `wallet.md`
+  shows integers and claims money "only changes hands through an admin", but `post_tips`
+  and `POST /transfers` both exist. The SDK models the decimal form as `Money` (exact
+  cents, so `10.01` cannot degrade into `10.009999`) and keeps whole-coin fields as `i64`.
 
 ## Testing
 
@@ -211,9 +242,11 @@ Rust core, FFI, sidecar, Python and Node bindings are complete and green:
 
 | Suite | Result |
 | --- | --- |
-| `cargo test --workspace` | 209 tests + 1 doc-test |
-| Python (`unittest`) | 119 tests |
-| Node (`node --test`) | 61 tests |
+| `cargo test --workspace` | 328 tests + 1 doc-test |
+| Python (`unittest`) | 174 tests |
+| Node (`node --test`) | 113 tests |
+
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` are clean.
 
 ## Licence
 

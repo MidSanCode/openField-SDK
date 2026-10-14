@@ -96,5 +96,14 @@ protocol, error-mapping and discovery tests still run.
 - `chat.messages` returns messages **newest first**. The bundled `bots.md` §7.3 says
   otherwise; the server's SQL disagrees with the docs, and the SDK follows the SQL.
 - Content limits are counted in **bytes**, while a bot nickname is counted in **runes**.
+- **Money is spelled two ways.** `wallet()`, `recharge_wallet()` and `deduct_wallet()` speak
+  **decimal coins** — `10` is ten coins, `12.5` is twelve and a half — because the server's
+  `model.Cents` puts that on the wire. `tip_post()`, membership prices and task rewards are
+  **whole coins**, so the facades refuse a fractional value there rather than send a `400`.
+- A spending bot needs a payment PIN first: `set_payment_pin("123456")`. Until then every
+  payment endpoint answers `403 payment pin not set`. Five wrong attempts lock payments for
+  fifteen minutes.
+- `upload_chunked()` resumes rather than restarts: pass the previous `upload_id` and only the
+  parts the server is missing are re-sent.
 - The event channel is best-effort and does not replay across a disconnect, so reconcile
   anything durable by polling.

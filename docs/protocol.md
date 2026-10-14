@@ -208,6 +208,162 @@ envelope instead, because no status exists.
 - Message paging uses a **cursor**: `limit` and `before` (an exclusive message id).
 - A single `query` object carries the free-form filters (`q`, `tag`, `sender_id`, …); see
   `posts.search`, `chat.search` and `camps.list`.
+- **Money has two spellings and they are not interchangeable.** Wallet balances, wallet
+  transactions and `wallet.adjust` use the server's `model.Cents`, which serialises as a
+  **decimal coin** value: `10` is ten coins (1000 cents), `12.5` is twelve and a half. Tips,
+  membership prices, task rewards and make-up prices are plain integers of **whole coins**.
+  A binding that passes a decimal where the server binds `int64` gets a `400`, which is why
+  the Python and Node facades refuse a fractional value for those fields locally.
+- **Binary results travel as base64.** `plugins.download` is the only method whose response
+  is not JSON: the transport answers
+
+  ```json
+  { "size": 4096, "bytes": "UEsDBAoAAAAA…" }
+  ```
+
+  and a binding decodes `bytes` back to a buffer. The Rust API returns `Vec<u8>` directly,
+  and `ofbot_call`/the sidecar both carry the envelope above.
+
+## The wrapped endpoint groups
+
+Every method below has a typed wrapper in the Rust API and a facade in both bindings. The
+server-side contract is the one in the handlers, not in `docs/reference/`; where the two
+disagree, `core/src/docs.rs` records the conflict.
+
+### Wallet
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `wallet.get` | `page?`, `limit?` | `{balance, transactions, page, limit}` |
+| `wallet.adjust` | `user_id`, `amount` (signed decimal coins), `type?`, `description?` | `{balance, transaction}` |
+| `wallet.recharge` | `user_id`, `amount` (positive), `description?` | as `wallet.adjust` |
+| `wallet.deduct` | `user_id`, `amount` (positive), `description?` | as `wallet.adjust` |
+
+`wallet.adjust` stores `amount` **exactly as sent** and never reconciles it with `type`, so
+a positive amount labelled `deduct` is a credit. `wallet.recharge` and `wallet.deduct` take
+a positive amount and set the sign themselves. A deduction that would drive the balance
+below zero answers **`400 insufficient balance`** — not the `409` `wallet.md` documents.
+
+### Tasks and sign-in
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `tasks.list` | — | `{tasks, streak, makeup_cost}` |
+| `tasks.claim` | `code` | `{claimed, exp, currency}` |
+| `tasks.claim_daily` | `code` | `{claimed, exp, currency}` |
+| `tasks.login_claim` | — | `{granted, exp, currency, streak}` |
+| `tasks.login_calendar` | — | `{registered_at, today, signed, streak, makeup_cost, makeup_exp, days}` |
+| `tasks.makeup` | — | `{granted, exp, cost, streak}` |
+| `tasks.makeup_date` | `date` (`YYYY-MM-DD`) | `{granted, date, exp, cost, streak}` |
+| `tasks.exp_history` | `limit?` | `{entries}` |
+
+The **route** is `daily-login` (hyphen) while the task **code** is `daily_login`
+(underscore). Posting the code to the route matches the generic `/tasks/:code/claim`
+pattern instead, which is why `tasks.login_claim` exists as its own method.
+
+`404` is an unknown code; `409` is `task requirements not met` or `task already claimed`.
+Daily tiers are cumulative and once per local day. A make-up charges `makeup_cost` coins
+and grants experience but never the daily currency.
+
+### Membership and the payment PIN
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `membership.get` | — | `{level, name, active, expires_at, exp_multiplier, tiers, member_days, member_price, auto_renew}` |
+| `membership.purchase` | `level` (1..4), `pin` | `{status, paid, kind}` |
+| `membership.auto_renew` | `enabled`, `pin?` | membership status |
+| `membership.purchases` | `page?`, `limit?` | `{purchases, page, limit}` |
+| `membership.grant` | `user_id`, `level` (0 clears), `days?` | membership status |
+| `membership.exp_adjust` | `user_id`, `delta`, `description?` | `{exp, level}` |
+| `account.pin_set` | `pin`, `old_pin?` | `{set, has_pin}` |
+| `account.pin_change` | `old_pin`, `pin` | `{set, has_pin}` |
+| `account.pin_verify` | `pin` | `{valid}` |
+
+Every outgoing payment is authorized by the six-digit PIN, and **a freshly created bot has
+none**: the payment endpoints answer `403 payment pin not set` until `account.pin_set` runs.
+Five wrong entries lock payments for fifteen minutes and answer
+`429 尝试次数过多，请稍后再试`; the budget is shared by verification, tips, memberships and
+transfers. `membership.exp_adjust` takes `delta` — **not** `amount` — and a positive delta is
+multiplied by the target's membership multiplier before it is applied.
+
+### Moderation
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `moderation.punish` | `user_id`, `punishment` = `{type, reason?, permission_key?, duration_minutes?}` | `{punishment_id, type, expires_at}` |
+| `moderation.punishments` | `user_id`, `limit?` | `{punishments, permission_bans}` |
+
+`type` is one of `warning`, `demerit`, `revoke`, `temp_ban`, `ban`, `unban`, `restore`;
+`revoke`/`restore` require `permission_key` and `temp_ban` requires a positive
+`duration_minutes`. `permission_bans` is a list of permission **keys** currently withheld,
+not a list of records. The server refuses self-moderation and enforces rank, so a bot
+punishing itself or an administrator gets `403`.
+
+### Tips
+
+`posts.tip` takes `post_id`, `amount` (**whole coins**, 1..100000) and `pin`. The response
+is a `post_tips` row whose `amount` and `net_amount` are **cents**: a 5-coin tip records
+`amount = 500` and `net_amount = 475`, the 5 % platform fee having been taken. Tipping your
+own post is a `400`.
+
+### End-to-end encryption
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `e2ee.set_key` | `public_key` (empty clears it) | `{message}` |
+| `e2ee.keys` | `conversation_id` | `{version, envelopes, my_envelope, conversation_id}` |
+| `e2ee.put_keys` | `conversation_id`, `envelopes` | `{message, version}` |
+
+`envelopes` is an object keyed by the **member id as a JSON string**, because the handler
+binds `map[int64]string`:
+
+```json
+{ "conversation_id": 33, "envelopes": { "7": "base64…", "9": "base64…" } }
+```
+
+The server never inspects the ciphertext, refuses an empty batch with
+`400 no envelopes provided`, and answers `403` to a non-member.
+
+### Storage: chunked uploads, reuse and burn
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `storage.attachment` | `attachment_id` | the attachment |
+| `storage.by_hash` | `hash` (64 hex) | the attachment, or `404` |
+| `storage.burn_arm` | `attachment_id`, `burn_seconds` (1..86400) | `{id, burn_at}` |
+| `storage.chunk_init` | `upload` | `{upload_id, total_chunks}` |
+| `storage.chunk_upload` | `part` = `{upload_id, index, bytes}` | `{upload_id, index, size}` |
+| `storage.chunk_status` | `upload_id` | `{upload_id, uploaded}` |
+| `storage.chunk_complete` | `upload_id`, `upload` | the attachment |
+| `storage.chunked` | `upload`, `chunk_bytes?` | the attachment |
+
+`upload` is `{filename, size, total_chunks, mime_type?, visibility?}` and the same body is
+bound by `init` and `complete`. `size` may not exceed `total_chunks * 8 MiB`, the part count
+is capped at 10000, and each part is at most 8 MiB — all three are checked before the
+request. `chunk_upload` sends a `multipart/form-data` part under the field `chunk`, with
+1-based indexes. `chunk_complete` answers `409` with the missing indexes when parts are
+absent, and it verifies the **stored** byte total rather than the declaration.
+
+`storage.chunked` runs the whole flow: it opens a session, asks `chunk_status`, sends only
+the parts the server is missing, then completes — so re-running it resumes rather than
+restarts. `storage.burn_arm` is idempotent and only the **first view by someone other than
+the uploader** arms the countdown; for the uploader the handler answers `404`.
+
+### Plugin store
+
+| Method | Params | Returns |
+| --- | --- | --- |
+| `plugins.list` | — | `{plugins}` |
+| `plugins.get` | `plugin_id` | the plugin, or `404` |
+| `plugins.download` | `plugin_id` | `{size, bytes}` (base64) |
+| `plugins.upload` | `upload`, `publish?` | `{message, plugin}` |
+| `plugins.publish` / `plugins.unpublish` | `plugin_id` | `{message}` |
+| `plugins.delete` | `plugin_id` | `{message}` |
+
+`plugins.list` and `plugins.get` are `authPublic`, so they work on a client with no token;
+the download requires one and increments the download counter. Bundles are capped at 5 MiB
+and must carry a `manifest.json` at the zip root. Ids must match
+`^[a-z0-9][a-z0-9._-]{2,63}$`, and `.`/`..` are refused so an id can never act as a path.
 
 ## Events
 

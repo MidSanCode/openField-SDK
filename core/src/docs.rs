@@ -199,6 +199,38 @@ pub const KNOWN_DIVERGENCES: &[Divergence] = &[
         verdict: Verdict::Both,
         decision: "both rely on the default group holding `storage.*`, which `bots.md` appendix B confirms",
     },
+    Divergence {
+        topic: "wallet amount units",
+        bots_md: "not specified",
+        api_md: "`wallet.md` shows integer cents — `\"balance\": 10000` for 100.00 — and tells the client to format with `amount / 100`",
+        source: "`pkg/model/money.go`: `Cents.MarshalJSON` emits `cents / MoneyScale` (100) as a **decimal coin** value, and `UnmarshalJSON` accepts a number or a numeric string. `Wallet.Balance`, `WalletTransaction.Amount` and the `wallet.adjust` body all use `Cents`",
+        verdict: Verdict::Neither,
+        decision: "`Money` holds exact cents and renders the decimal form the server actually sends; reading the wire as cents, as `wallet.md` describes, would be wrong by a factor of 100",
+    },
+    Divergence {
+        topic: "wallet response shape and refusal status",
+        bots_md: "not specified",
+        api_md: "`wallet.md` shows `{\"balance\", \"transactions\"}` and says a below-zero deduction answers `409` (or `400`)",
+        source: "`wallet.go` `GetMyWallet` also echoes `page` and `limit`, and `AdjustWallet` answers `400 {\"error\":\"insufficient balance\"}` for `repository.ErrInsufficientBalance`; no 409 exists on that path",
+        verdict: Verdict::Neither,
+        decision: "`WalletPage` models the `page`/`limit` fields and the SDK records `400` as the refusal, so a caller that only handled the documented `409` is not caught out",
+    },
+    Divergence {
+        topic: "whether peer-to-peer money movement exists",
+        bots_md: "not specified",
+        api_md: "`wallet.md` states money \"only changes hands through an admin (recharge / deduction) — there is no peer-to-peer tipping\"",
+        source: "`pkg/repository/tip.go` implements `post_tips` with a 5 % platform fee, `post.go` exposes `POST /posts/:id/tips`, and `transfer.go` implements `POST /transfers` with accept/decline — all three move money between users",
+        verdict: Verdict::Neither,
+        decision: "the SDK wraps `posts.tip`; the transfer flow stays on `request` and is listed as unwrapped in the README, rather than omitted on the strength of the doc",
+    },
+    Divergence {
+        topic: "task and sign-in route coverage",
+        bots_md: "not specified",
+        api_md: "`daily-tasks.md` lists two routes: `GET /tasks` and `POST /tasks/daily/:code/claim`",
+        source: "the gateway table also carries `POST /tasks/daily-login/claim`, `GET /tasks/daily-login/calendar`, `POST /tasks/daily-login/makeup`, `POST /tasks/daily-login/makeup-date`, `POST /tasks/:code/claim` and `GET /exp/history`, and `task.go` implements a streak, a make-up price and a three-day make-up window",
+        verdict: Verdict::Neither,
+        decision: "the whole sign-in surface is wrapped, and the route/code spelling split is called out because posting the `daily_login` code to the route silently reaches the generic `:code` claim instead of the sign-in",
+    },
 ];
 
 /// Look up a divergence by topic.
@@ -286,9 +318,23 @@ mod tests {
             "reaction request body",
             "content length limit unit",
             "whether a general rate limit exists",
+            "wallet amount units",
+            "wallet response shape and refusal status",
+            "whether peer-to-peer money movement exists",
+            "task and sign-in route coverage",
         ] {
             assert!(divergence(topic).is_some(), "{topic} must be recorded");
         }
+    }
+
+    #[test]
+    fn the_money_divergence_names_the_factor_of_one_hundred() {
+        // The wallet note in `docs/reference/` is off by 100×, which is the kind of error
+        // that silently multiplies every balance a client shows.
+        let entry = divergence("wallet amount units").unwrap();
+        assert_eq!(entry.verdict, Verdict::Neither);
+        assert!(entry.source.contains("decimal coin"));
+        assert!(entry.decision.contains("100"));
     }
 
     #[test]
