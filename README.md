@@ -259,4 +259,14 @@ Rust core, FFI, sidecar, Python and Node bindings are complete and green:
 
 ## Licence
 
-MIT OR Apache-2.0.
+**GPL-3.0-only** — GNU General Public License, version 3. The full text is in
+[`LICENSE`](LICENSE).
+
+This is the same licence the server uses
+([`MidSanCode/openField-server`](https://github.com/midSanCode/openField-server) ships the
+identical `LICENSE` blob), so the SDK and the software it talks to are under one licence.
+
+Note what a copyleft licence means in practice: GPL-3.0-only is **not** permissive. If you
+distribute a bot, a plugin or any other work built on this SDK, that work has to be licensed
+under GPL-3.0-only too. Using the SDK privately, or on a server you do not distribute, does
+not trigger that. Judge it yourself or ask a lawyer; this paragraph is not legal advice.

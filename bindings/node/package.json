@@ -33,7 +33,7 @@
   "bugs": {
     "url": "https://github.com/MidSanCode/openField-SDK/issues"
   },
-  "license": "MIT OR Apache-2.0",
+  "license": "GPL-3.0-only",
   "dependencies": {},
   "devDependencies": {}
 }
