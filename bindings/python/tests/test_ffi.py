@@ -293,6 +293,49 @@ class FfiAgainstMockTests(unittest.TestCase):
         # And a real call must agree field for field.
         self.assertEqual(self.transport.call("health"), self.sidecar.call("health"))
 
+    def test_the_extended_surface_agrees_too(self) -> None:
+        """The money, task and chunked paths were added to the shared table, not to one
+        transport: the C ABI must answer them exactly as the sidecar does.
+        """
+        self.sidecar.call(
+            "client.init", {"base_url": self.info["base_url"], "token": self.info["token"]}
+        )
+        for method, params in [
+            ("wallet.get", None),
+            ("tasks.list", None),
+            ("tasks.login_calendar", None),
+            ("membership.get", None),
+            ("moderation.punishments", {"user_id": 7}),
+            ("plugins.list", None),
+        ]:
+            with self.subTest(method=method):
+                self.assertEqual(
+                    self.transport.call(method, params),
+                    self.sidecar.call(method, params),
+                )
+
+        # `chunk_init` mints a fresh session id per call, so only its shape can be
+        # compared; the id is exactly what must differ.
+        chunked = {"filename": "a.bin", "size": 8, "total_chunks": 1}
+        via_ffi = self.transport.call("storage.chunk_init", {"upload": chunked})
+        via_sidecar = self.sidecar.call("storage.chunk_init", {"upload": chunked})
+        self.assertEqual(via_ffi["total_chunks"], via_sidecar["total_chunks"])
+        self.assertNotEqual(via_ffi["upload_id"], via_sidecar["upload_id"])
+
+    def test_a_binary_download_crosses_the_abi_as_base64(self) -> None:
+        """`plugins.download` is the only raw-bytes method, so its base64 envelope is
+        worth proving over the C ABI rather than only the sidecar.
+        """
+        self.sidecar.call(
+            "client.init", {"base_url": self.info["base_url"], "token": self.info["token"]}
+        )
+        via_ffi = self.bot.download_plugin("demo")
+        self.assertEqual(via_ffi, b"PK\x03\x04demo-bundle")
+        self.assertEqual(
+            self.transport.call("plugins.download", {"plugin_id": "demo"}),
+            self.sidecar.call("plugins.download", {"plugin_id": "demo"}),
+        )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

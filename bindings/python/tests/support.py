@@ -94,6 +94,10 @@ class TestkitCase(unittest.TestCase):
         """The recorded calls to one path."""
         return [entry for entry in self.requests() if entry["path"] == path]
 
+    def clear_requests(self) -> None:
+        """Drop the recorded request log, so a test can assert on one action alone."""
+        self.sidecar.call("testkit.clear_requests")
+
     def broadcast(self, event: dict[str, object]) -> int:
         """Push an event to every connected WebSocket client."""
         return self.sidecar.call("testkit.broadcast", {"event": event})["delivered"]

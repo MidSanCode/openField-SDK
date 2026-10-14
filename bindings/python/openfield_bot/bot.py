@@ -735,6 +735,628 @@ class Bot:
         """Delete an attachment."""
         return self.call("storage.delete", attachment_id=attachment_id)
 
+    def attachment(self, attachment_id: int) -> dict[str, Any]:
+        """Fetch one attachment record by id."""
+        return self.call("storage.attachment", attachment_id=attachment_id)
+
+    def attachment_by_hash(self, hex_digest: str) -> dict[str, Any]:
+        """Look an attachment up by the lowercase hex SHA-256 of its bytes.
+
+        Deduplication is per user, so this only finds blobs this bot uploaded.
+
+        Raises:
+            InvalidArgumentError: the digest is not 64 hex characters.
+            NotFoundError: nothing matches.
+        """
+        digest = _require_sha256(hex_digest)
+        return self.call("storage.by_hash", hash=digest)
+
+    def arm_attachment_burn(self, attachment_id: int, burn_seconds: int) -> dict[str, Any]:
+        """Arm a burn-after-view countdown of at most 24 hours.
+
+        The deadline starts on the **first view by someone else**; the uploader can
+        never trigger it, and for the uploader the server answers 404 exactly as it
+        does for an unknown id.
+
+        Args:
+            attachment_id: the attachment to arm.
+            burn_seconds: 1..86400.
+
+        Raises:
+            InvalidArgumentError: ``burn_seconds`` is outside ``1..86400``.
+        """
+        seconds = _require_int("burn_seconds", burn_seconds)
+        if not 1 <= seconds <= 86_400:
+            raise InvalidArgumentError(f"burn_seconds must be 1..86400, got {seconds}")
+        return self.call(
+            "storage.burn_arm", attachment_id=attachment_id, burn_seconds=seconds
+        )
+
+    # -- chunked uploads ---------------------------------------------------
+
+    #: Largest single chunk the server accepts.
+    CHUNK_BYTES = 8 * 1024 * 1024
+    #: Largest number of chunks per session.
+    MAX_CHUNKS = 10_000
+
+    def start_chunked_upload(
+        self,
+        filename: str,
+        size: int,
+        total_chunks: int,
+        *,
+        mime_type: Optional[str] = None,
+        visibility: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Open a resumable upload session and return ``{"upload_id", "total_chunks"}``.
+
+        Raises:
+            InvalidArgumentError: a part count above :attr:`MAX_CHUNKS`, or a ``size``
+                the declared chunk count cannot reach.
+            PayloadTooLargeError: above the upload cap or the storage quota.
+        """
+        upload = self._chunk_layout(
+            filename, size, total_chunks, mime_type=mime_type, visibility=visibility
+        )
+        return self.call("storage.chunk_init", upload=upload)
+
+    def chunk_status(self, upload_id: str) -> dict[str, Any]:
+        """Which 1-based chunk indexes already landed, for a resume."""
+        return self.call("storage.chunk_status", upload_id=upload_id)
+
+    def upload_chunk(self, upload_id: str, index: int, data: bytes) -> dict[str, Any]:
+        """Store one chunk. Indexes are 1-based; the multipart field is ``chunk``.
+
+        Raises:
+            InvalidArgumentError: an index below 1, or a chunk above :attr:`CHUNK_BYTES`.
+            NotFoundError: the session is gone or belongs to someone else.
+        """
+        number = _require_int("index", index)
+        if number < 1:
+            raise InvalidArgumentError(f"chunk index is 1-based, got {number}")
+        if len(data) > self.CHUNK_BYTES:
+            raise InvalidArgumentError(
+                f"chunk is {len(data)} bytes, above the {self.CHUNK_BYTES} byte limit"
+            )
+        part = {
+            "upload_id": upload_id,
+            "index": number,
+            "bytes": base64.b64encode(data).decode("ascii"),
+        }
+        return self.call("storage.chunk_upload", part=part)
+
+    def complete_chunked_upload(
+        self,
+        upload_id: str,
+        filename: str,
+        size: int,
+        total_chunks: int,
+        *,
+        mime_type: Optional[str] = None,
+        visibility: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Assemble the stored chunks into an attachment.
+
+        Raises:
+            ConflictError: chunks are missing; the message names them.
+        """
+        upload = self._chunk_layout(
+            filename, size, total_chunks, mime_type=mime_type, visibility=visibility
+        )
+        return self.call("storage.chunk_complete", upload_id=upload_id, upload=upload)
+
+    def upload_chunked(
+        self,
+        file_name: str,
+        data: bytes,
+        *,
+        chunk_bytes: Optional[int] = None,
+        upload_id: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        visibility: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Upload a large payload through the chunked path, resuming if asked.
+
+        Args:
+            file_name: the name the server records.
+            data: the whole payload.
+            chunk_bytes: part size; defaults to :attr:`CHUNK_BYTES` and is clamped.
+            upload_id: continue an open session instead of starting one, so a retry
+                re-sends only the parts the server is missing.
+        """
+        if not data:
+            raise InvalidArgumentError("nothing to upload")
+        size = chunk_bytes if chunk_bytes is not None else self.CHUNK_BYTES
+        size = min(max(1, int(size)), self.CHUNK_BYTES)
+        parts = [data[offset : offset + size] for offset in range(0, len(data), size)]
+        upload = self._chunk_layout(
+            file_name,
+            len(data),
+            len(parts),
+            mime_type=mime_type,
+            visibility=visibility,
+        )
+        session_id = upload_id
+        if session_id is None:
+            session_id = self.call("storage.chunk_init", upload=upload)["upload_id"]
+        stored = set(self.call("storage.chunk_status", upload_id=session_id).get("uploaded") or ())
+        for index, part in enumerate(parts, start=1):
+            # Resuming skips whatever the server already holds.
+            if index not in stored:
+                self.upload_chunk(session_id, index, part)
+        return self.call("storage.chunk_complete", upload_id=session_id, upload=upload)
+
+    def _chunk_layout(
+        self,
+        filename: str,
+        size: int,
+        total_chunks: int,
+        *,
+        mime_type: Optional[str],
+        visibility: Optional[str],
+    ) -> dict[str, Any]:
+        """Build and check the ``init``/``complete`` body, which share one shape."""
+        if not filename or not filename.strip():
+            raise InvalidArgumentError("filename is required")
+        size = _require_int("size", size)
+        total_chunks = _require_int("total_chunks", total_chunks)
+        if size <= 0:
+            raise InvalidArgumentError(f"size must be positive, got {size}")
+        if total_chunks <= 0:
+            raise InvalidArgumentError(f"total_chunks must be positive, got {total_chunks}")
+        if total_chunks > self.MAX_CHUNKS:
+            raise InvalidArgumentError(
+                f"total_chunks must be at most {self.MAX_CHUNKS}, got {total_chunks}"
+            )
+        if size > total_chunks * self.CHUNK_BYTES:
+            raise InvalidArgumentError(
+                f"declared size {size} exceeds what {total_chunks} chunks can carry"
+            )
+        upload: dict[str, Any] = {
+            "filename": filename,
+            "size": size,
+            "total_chunks": total_chunks,
+        }
+        if mime_type is not None:
+            upload["mime_type"] = mime_type
+        if visibility is not None:
+            upload["visibility"] = visibility
+        return upload
+
+    # -- wallet ------------------------------------------------------------
+
+    def wallet(self, *, page: Optional[int] = None, limit: Optional[int] = None) -> dict[str, Any]:
+        """This bot's balance and a page of its transactions.
+
+        Amounts are **decimal coins**, the shape the server's ``model.Cents`` puts on
+        the wire: ``10`` is ten coins and ``12.5`` is twelve and a half. Keep cents in
+        your own arithmetic if you need exactness.
+        """
+        params: dict[str, Any] = {}
+        if page is not None:
+            params["page"] = page
+        if limit is not None:
+            params["limit"] = limit
+        return self.call("wallet.get", **params)
+
+    def recharge_wallet(
+        self, user_id: int, amount: float, *, description: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Credit ``amount`` coins to ``user_id``. Needs ``wallet.manage``.
+
+        The default group holds ``wallet.manage``, so any authenticated bot can move
+        any user's balance until the server tightens group permissions.
+        """
+        return self._adjust_wallet("wallet.recharge", user_id, amount, description)
+
+    def deduct_wallet(
+        self, user_id: int, amount: float, *, description: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Debit ``amount`` coins from ``user_id``. Needs ``wallet.manage``.
+
+        Unlike :meth:`adjust_wallet`, the sign is handled here: the server stores the
+        amount verbatim and never checks it against the transaction type, so a
+        positive value would silently become a credit.
+
+        Raises:
+            BadRequestError: the deduction would drive the balance below zero.
+        """
+        return self._adjust_wallet("wallet.deduct", user_id, amount, description)
+
+    def adjust_wallet(
+        self,
+        user_id: int,
+        amount: float,
+        *,
+        type: Optional[str] = None,  # noqa: A002 - mirrors the API's own field name
+        description: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Apply a signed balance change, exactly as the wire takes it.
+
+        Args:
+            user_id: whose wallet.
+            amount: **signed** decimal coins. Positive credits, negative debits.
+            type: ``recharge`` or ``deduct``. The server records it as a label and
+                does **not** reconcile it with the sign, so a positive ``amount``
+                with ``type="deduct"`` is a credit.
+            description: optional operator note.
+        """
+        params: dict[str, Any] = {
+            "user_id": _require_int("user_id", user_id),
+            "amount": _require_amount("amount", amount),
+        }
+        if type is not None:
+            params["type"] = type
+        if description is not None:
+            params["description"] = description
+        return self.call("wallet.adjust", **params)
+
+    def _adjust_wallet(
+        self, method: str, user_id: int, amount: float, description: Optional[str]
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "user_id": _require_int("user_id", user_id),
+            "amount": _require_amount("amount", amount),
+        }
+        if description is not None:
+            params["description"] = description
+        return self.call(method, **params)
+
+    # -- tasks, sign-in and experience -------------------------------------
+
+    def tasks(self) -> dict[str, Any]:
+        """The task catalog with this bot's progress, streak and make-up price.
+
+        Currency figures here are **whole coins**, unlike the wallet's decimal coins.
+        """
+        return self.call("tasks.list")
+
+    def claim_task(self, code: str) -> dict[str, Any]:
+        """Claim a one-time or streak task: ``{"claimed", "exp", "currency"}``.
+
+        Raises:
+            NotFoundError: no such task code.
+            ConflictError: not earned yet, or already claimed.
+        """
+        return self.call("tasks.claim", code=code)
+
+    def claim_daily_task(self, code: str) -> dict[str, Any]:
+        """Claim one of today's activity tiers. Each tier is once per local day.
+
+        Raises:
+            ConflictError: ``task requirements not met`` or ``task already claimed today``.
+        """
+        return self.call("tasks.claim_daily", code=code)
+
+    def claim_daily_login(self) -> dict[str, Any]:
+        """Sign in for today.
+
+        A second call is not an error: it answers ``{"granted": False}``.
+        """
+        return self.call("tasks.login_claim")
+
+    def checkin_calendar(self) -> dict[str, Any]:
+        """The sign-in grid: ``registered_at``, ``today``, ``signed``, ``days``, …"""
+        return self.call("tasks.login_calendar")
+
+    def makeup_checkin(self) -> dict[str, Any]:
+        """Pay to make up the most recent missed sign-in.
+
+        A make-up renews the streak and grants experience but never the daily
+        currency.
+
+        Raises:
+            ConflictError: the gap is wider than three days.
+        """
+        return self.call("tasks.makeup")
+
+    def makeup_checkin_on(self, date: str) -> dict[str, Any]:
+        """Pay to sign in one specific missed day (``YYYY-MM-DD``, game timezone).
+
+        Raises:
+            InvalidArgumentError: the date is not ``YYYY-MM-DD``.
+            BadRequestError: the date is today, in the future, or before registration.
+        """
+        if len(date) != 10 or date[4] != "-" or date[7] != "-":
+            raise InvalidArgumentError(f"date must be `YYYY-MM-DD`, got {date!r}")
+        return self.call("tasks.makeup_date", date=date)
+
+    def exp_history(self, *, limit: Optional[int] = None) -> Any:
+        """Newest-first experience awards."""
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        return self.call("tasks.exp_history", **params)
+
+    # -- membership and the payment PIN ------------------------------------
+
+    def membership(self) -> dict[str, Any]:
+        """This bot's membership state plus the purchasable catalog."""
+        return self.call("membership.get")
+
+    def purchase_membership(self, level: int, pin: str) -> dict[str, Any]:
+        """Buy a membership tier with wallet coins, authorized by the payment PIN.
+
+        Raises:
+            BadRequestError: an invalid level, or a balance that cannot cover it.
+            ForbiddenError: no payment PIN has been set (see :meth:`set_payment_pin`).
+            UnauthorizedError: the PIN is wrong; it counts against a five-failure budget.
+            RateLimitedError: that budget is exhausted (15-minute lockout).
+        """
+        level = _require_int("level", level)
+        if not 1 <= level <= 4:
+            raise InvalidArgumentError(f"membership level must be 1..4, got {level}")
+        if not pin:
+            raise InvalidArgumentError("pin must not be empty")
+        return self.call("membership.purchase", level=level, pin=pin)
+
+    def set_auto_renew(self, enabled: bool, *, pin: Optional[str] = None) -> dict[str, Any]:
+        """Toggle automatic renewal.
+
+        Enabling pre-authorizes future charges and needs ``pin``; disabling needs only
+        the token.
+
+        Raises:
+            InvalidArgumentError: enabling without a PIN.
+            ForbiddenError: enabling with no PIN configured on the account.
+        """
+        params: dict[str, Any] = {"enabled": bool(enabled)}
+        if pin is not None:
+            params["pin"] = pin
+        elif enabled:
+            raise InvalidArgumentError("enabling auto-renew needs the payment pin")
+        return self.call("membership.auto_renew", **params)
+
+    def membership_purchases(
+        self, *, page: Optional[int] = None, limit: Optional[int] = None
+    ) -> dict[str, Any]:
+        """This bot's membership purchase history."""
+        params: dict[str, Any] = {}
+        if page is not None:
+            params["page"] = page
+        if limit is not None:
+            params["limit"] = limit
+        return self.call("membership.purchases", **params)
+
+    def grant_membership(
+        self, user_id: int, level: int, *, days: Optional[int] = None
+    ) -> dict[str, Any]:
+        """Grant a membership directly, skipping the wallet. Needs ``user.membership.grant``.
+
+        ``level=0`` clears the membership.
+        """
+        params: dict[str, Any] = {
+            "user_id": _require_int("user_id", user_id),
+            "level": _require_int("level", level),
+        }
+        if days is not None:
+            params["days"] = _require_int("days", days)
+        return self.call("membership.grant", **params)
+
+    def adjust_exp(
+        self, user_id: int, delta: int, *, description: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Adjust a user's experience. Needs ``user.adjust_exp``.
+
+        ``delta`` is signed and the field is named ``delta``, not ``amount``. A
+        positive delta is multiplied by the target's membership multiplier first.
+
+        Returns:
+            ``{"exp": ..., "level": ...}``.
+        """
+        params: dict[str, Any] = {
+            "user_id": _require_int("user_id", user_id),
+            "delta": _require_int("delta", delta),
+        }
+        if description is not None:
+            params["description"] = description
+        return self.call("membership.exp_adjust", **params)
+
+    def set_payment_pin(self, pin: str, *, old_pin: Optional[str] = None) -> dict[str, Any]:
+        """Set the six-digit payment PIN.
+
+        Every outgoing payment -- tips, memberships and transfers -- is authorized by
+        this PIN, and a freshly created bot has none, so this is what a spending bot
+        must call first. Replacing an existing PIN requires ``old_pin``.
+
+        Raises:
+            InvalidArgumentError: the PIN is not exactly six digits.
+            ForbiddenError: a PIN already exists and ``old_pin`` was omitted.
+        """
+        _require_pin(pin)
+        params: dict[str, Any] = {"pin": pin}
+        if old_pin is not None:
+            params["old_pin"] = old_pin
+        return self.call("account.pin_set", **params)
+
+    def change_payment_pin(self, old_pin: str, pin: str) -> dict[str, Any]:
+        """Replace the payment PIN, presenting the current one."""
+        _require_pin(pin)
+        if not old_pin:
+            raise InvalidArgumentError("old_pin must not be empty")
+        return self.call("account.pin_change", old_pin=old_pin, pin=pin)
+
+    def verify_payment_pin(self, pin: str) -> bool:
+        """Check a PIN without spending anything.
+
+        A wrong PIN is **counted** against the same five-failure budget that tips and
+        memberships use, so probing this can lock payments for fifteen minutes.
+        """
+        if not pin:
+            raise InvalidArgumentError("pin must not be empty")
+        return bool(self.call("account.pin_verify", pin=pin)["valid"])
+
+    # -- moderation --------------------------------------------------------
+
+    #: The punishment types the server accepts.
+    PUNISHMENT_TYPES = (
+        "warning",
+        "demerit",
+        "revoke",
+        "temp_ban",
+        "ban",
+        "unban",
+        "restore",
+    )
+
+    def punish(
+        self,
+        user_id: int,
+        type: str,  # noqa: A002 - mirrors the API's own field name
+        *,
+        reason: Optional[str] = None,
+        permission_key: Optional[str] = None,
+        duration_minutes: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Record a moderation action. Needs ``user.punish``, which the default group lacks.
+
+        Args:
+            user_id: the sanctioned user. Not yourself: that is a 403.
+            type: one of :attr:`PUNISHMENT_TYPES`.
+            reason: optional free text.
+            permission_key: required for ``revoke`` and ``restore``.
+            duration_minutes: required for ``temp_ban``.
+
+        Returns:
+            ``{"punishment_id", "type", "expires_at"}``.
+        """
+        if type not in self.PUNISHMENT_TYPES:
+            raise InvalidArgumentError(
+                f"unknown punishment type {type!r}; expected one of "
+                f"{', '.join(self.PUNISHMENT_TYPES)}"
+            )
+        if type in ("revoke", "restore") and not permission_key:
+            raise InvalidArgumentError(f"{type} requires permission_key")
+        if type == "temp_ban" and not duration_minutes:
+            raise InvalidArgumentError("temp_ban requires a positive duration_minutes")
+        punishment: dict[str, Any] = {"type": type}
+        if reason is not None:
+            punishment["reason"] = reason
+        if permission_key is not None:
+            punishment["permission_key"] = permission_key
+        if duration_minutes is not None:
+            punishment["duration_minutes"] = _require_int(
+                "duration_minutes", duration_minutes
+            )
+        return self.call("moderation.punish", user_id=user_id, punishment=punishment)
+
+    def punishments(self, user_id: int, *, limit: Optional[int] = None) -> dict[str, Any]:
+        """A user's moderation history plus the permissions currently withheld.
+
+        ``permission_bans`` is a list of permission *keys*, not records.
+        """
+        params: dict[str, Any] = {"user_id": _require_int("user_id", user_id)}
+        if limit is not None:
+            params["limit"] = limit
+        return self.call("moderation.punishments", **params)
+
+    # -- end-to-end encryption ---------------------------------------------
+
+    def set_e2ee_public_key(self, public_key: str) -> dict[str, Any]:
+        """Publish this bot's E2EE public key. An empty string clears it."""
+        return self.call("e2ee.set_key", public_key=public_key)
+
+    def e2ee_keys(self, conversation_id: int) -> dict[str, Any]:
+        """Every group-key envelope plus this bot's own, for one conversation."""
+        return self.call("e2ee.keys", conversation_id=conversation_id)
+
+    def put_e2ee_keys(self, conversation_id: int, envelopes: dict[int, str]) -> dict[str, Any]:
+        """Store a rotated batch of group-key envelopes.
+
+        Args:
+            conversation_id: the group the keys belong to. The caller must be a member.
+            envelopes: ``{target_user_id: ciphertext}``. The server relays the
+                ciphertext untouched and refuses an empty batch.
+        """
+        if not envelopes:
+            raise InvalidArgumentError("at least one envelope is required")
+        # Go binds `map[int64]string`, so the ids are JSON object keys.
+        batch = {str(user_id): ciphertext for user_id, ciphertext in envelopes.items()}
+        return self.call("e2ee.put_keys", conversation_id=conversation_id, envelopes=batch)
+
+    # -- plugin store ------------------------------------------------------
+
+    def plugins(self) -> dict[str, Any]:
+        """The published plugin catalog. Public: no token is required."""
+        return self.call("plugins.list")
+
+    def plugin(self, plugin_id: str) -> dict[str, Any]:
+        """One published plugin by id.
+
+        Raises:
+            NotFoundError: absent *or* unpublished; the two are indistinguishable.
+        """
+        return self.call("plugins.get", plugin_id=_require_plugin_id(plugin_id))
+
+    def download_plugin(self, plugin_id: str) -> bytes:
+        """Download a bundle. Requires a token, and increments the download counter."""
+        answer = self.call("plugins.download", plugin_id=_require_plugin_id(plugin_id))
+        return base64.b64decode(answer["bytes"])
+
+    def download_plugin_to(self, plugin_id: str, path: str | os.PathLike[str]) -> int:
+        """Download a bundle and write it to ``path``. Returns the byte count."""
+        data = self.download_plugin(plugin_id)
+        target = Path(path)
+        target.write_bytes(data)
+        return len(data)
+
+    def upload_plugin(
+        self, file_name: str, data: bytes, *, publish: bool = False
+    ) -> dict[str, Any]:
+        """Upload a bundle. Needs ``plugin.manage``.
+
+        The service caps bundles at 5 MiB and requires a ``manifest.json`` at the zip
+        root with a valid id and semantic version.
+        """
+        if len(data) > 5 * 1024 * 1024:
+            raise InvalidArgumentError(f"bundle is {len(data)} bytes, above the 5 MiB limit")
+        upload: dict[str, Any] = {
+            "file_name": file_name,
+            "bytes": base64.b64encode(data).decode("ascii"),
+            "mime": "application/zip",
+        }
+        return self.call("plugins.upload", upload=upload, publish=bool(publish))
+
+    def upload_plugin_file(
+        self, path: str | os.PathLike[str], *, publish: bool = False
+    ) -> dict[str, Any]:
+        """Upload a bundle read from disk."""
+        target = Path(path)
+        return self.upload_plugin(target.name, target.read_bytes(), publish=publish)
+
+    def publish_plugin(self, plugin_id: str) -> Any:
+        """List a plugin on the store."""
+        return self.call("plugins.publish", plugin_id=_require_plugin_id(plugin_id))
+
+    def unpublish_plugin(self, plugin_id: str) -> Any:
+        """Hide a plugin from the store, keeping the row and the bundle."""
+        return self.call("plugins.unpublish", plugin_id=_require_plugin_id(plugin_id))
+
+    def delete_plugin(self, plugin_id: str) -> Any:
+        """Delete a plugin row and its bundle."""
+        return self.call("plugins.delete", plugin_id=_require_plugin_id(plugin_id))
+
+    # -- tips --------------------------------------------------------------
+
+    def tip_post(self, post_id: int, amount: int, pin: str) -> dict[str, Any]:
+        """Tip a post with coins, authorized by the payment PIN.
+
+        ``amount`` is a whole **coin** count (1..100000), not the wallet's decimal
+        coins. The response reports cents: a 5-coin tip records ``amount=500`` and
+        ``net_amount=475``, the 5 % platform fee having been taken. The post author
+        gets the rest, and a deleted post refunds the tipper.
+
+        Raises:
+            InvalidArgumentError: the amount is outside ``1..100000`` or is not an int.
+            BadRequestError: tipping your own post.
+        """
+        coins = _require_int("amount", amount)
+        if not 1 <= coins <= 100_000:
+            raise InvalidArgumentError(f"tip amount must be 1..100000 coins, got {coins}")
+        if not pin:
+            raise InvalidArgumentError("pin must not be empty")
+        return self.call("posts.tip", post_id=post_id, amount=coins, pin=pin)
+
     # -- moderation, notifications, instance -------------------------------
 
     #: The report target kinds the server accepts.
@@ -997,6 +1619,68 @@ class Bot:
                         return
 
             time.sleep(settle)
+
+
+def _require_amount(name: str, value: Any) -> float:
+    """Accept a monetary amount as an int or a float, in decimal coins.
+
+    ``bool`` is rejected for the same reason as in :func:`_require_int`: ``True`` is
+    never an amount. A string is rejected too, even though the server's
+    ``Cents.UnmarshalJSON`` would parse one, because it hides the unit.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidArgumentError(f"{name} must be a number of coins, got {value!r}")
+    return value
+
+
+def _require_int(name: str, value: Any) -> int:
+    """Coerce an integer field, refusing the shapes Go's decoder would refuse.
+
+    ``bool`` is an ``int`` in Python, so it is rejected explicitly: sending ``True``
+    where the server binds an ``int64`` is never what the caller meant. A float is
+    rejected too -- Go refuses ``5.0`` for an ``int64`` -- and so is a numeric string
+    the caller should have passed as a number.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidArgumentError(f"{name} must be an integer, got {value!r}")
+    return value
+
+
+def _require_sha256(hex_digest: str) -> str:
+    """Normalise a SHA-256 digest to the lowercase 64-character hex the server looks up."""
+    digest = hex_digest.strip().lower() if isinstance(hex_digest, str) else ""
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise InvalidArgumentError("hash must be 64 hexadecimal characters (SHA-256)")
+    return digest
+
+
+def _require_pin(pin: str) -> str:
+    """A payment PIN is exactly six digits (``security.ValidPin``)."""
+    if not isinstance(pin, str) or len(pin) != 6 or not pin.isdigit():
+        raise InvalidArgumentError("the payment pin must be exactly 6 digits")
+    return pin
+
+
+def _require_plugin_id(plugin_id: str) -> str:
+    """Reject a plugin id the service would reject, and never let one act as a path."""
+    candidate = plugin_id.strip() if isinstance(plugin_id, str) else ""
+    allowed = "._-"
+    shaped = (
+        3 <= len(candidate) <= 64
+        and candidate[0].isascii()
+        and (candidate[0].islower() or candidate[0].isdigit())
+        and all(
+            character.isascii()
+            and (character.islower() or character.isdigit() or character in allowed)
+            for character in candidate
+        )
+    )
+    # `.` and `..` satisfy the character class, so they are excluded by name.
+    if not shaped or candidate in (".", ".."):
+        raise InvalidArgumentError(
+            f"plugin id {plugin_id!r} must match ^[a-z0-9][a-z0-9._-]{{2,63}}$"
+        )
+    return candidate
 
 
 def _message_id(message: dict[str, Any]) -> Optional[int]:
