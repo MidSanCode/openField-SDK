@@ -1,0 +1,20 @@
+[package]
+name = "openfield-bot-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI for the OpenField community bot SDK"
+
+[lib]
+name = "openfield_bot_ffi"
+# `cdylib` for dynamic loading (Python `ctypes`, C, Go via cgo, .NET via P/Invoke),
+# `staticlib` for linking straight into a C/C++ program.
+crate-type = ["cdylib", "staticlib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+openfield-bot-sdk = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true

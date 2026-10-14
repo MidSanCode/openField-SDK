@@ -1,0 +1,30 @@
+{
+  "name": "openfield-bot",
+  "version": "0.1.0",
+  "description": "OpenField community bot SDK: a Rust core driven through a JSON-RPC sidecar",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "test:watch": "node --test --watch test/"
+  },
+  "keywords": [
+    "openfield",
+    "bot",
+    "sdk",
+    "chatbot"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {}
+}

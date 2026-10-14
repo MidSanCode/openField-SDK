@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+**/target/
+
+# A relocated cargo home, used when the real ~/.cargo is not writable (a sandboxed or
+# Nix-managed home). It is a build aid, not part of this project.
+/.cargo-home/
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Local scratch, not part of the deliverable
+/probe2/
+/.server-ref/
+/.incoming/

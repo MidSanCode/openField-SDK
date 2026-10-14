@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openfield-bot"
+version = "0.1.0"
+description = "OpenField community bot SDK: a Rust core driven through a JSON-RPC sidecar or the C ABI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["openfield", "bot", "sdk", "chatbot"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Communications :: Chat",
+  "Typing :: Typed",
+]
+# No runtime dependencies: the transport is either a subprocess or ctypes, both stdlib.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.5"]
+
+[project.urls]
+Documentation = "https://github.com/midSanCode/openField-server"
+
+[tool.hatch.build.targets.wheel]
+packages = ["openfield_bot"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RET"]
+ignore = [
+  "A003",   # an attribute named `type` mirrors the API's own field name
+  "N818",   # exceptions are named for the HTTP status, not with an `Error` suffix
+  "UP038",  # isinstance with a tuple reads better here
+]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unreachable = true

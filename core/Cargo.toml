@@ -1,0 +1,36 @@
+[package]
+name = "openfield-bot-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust core for the OpenField community bot SDK"
+readme = "../README.md"
+keywords = ["openfield", "bot", "sdk", "chatbot"]
+categories = ["api-bindings", "web-programming::http-client"]
+
+[lib]
+name = "openfield_bot"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "3.4.2", default-features = false, features = [
+    "rustls",
+    "json",
+    "multipart",
+] }
+tungstenite = { version = "0.30.0", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "handshake",
+    "url",
+] }
+polling = "3.7"
+thiserror = "2"
+
+[features]
+default = []
+# The in-process mock OpenField server used by every binding's test suite.
+testkit = []

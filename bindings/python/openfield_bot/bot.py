@@ -1,0 +1,1089 @@
+"""The :class:`Bot` facade: one Python API over both transports.
+
+``Bot`` adds nothing the Rust core cannot do -- it maps Python names onto the shared
+method index and turns the documented bot recipes (``bots.md`` sections 7, 9 and 12) into
+small helpers. Everything it can do is also reachable through :meth:`Bot.call`, so a
+missing wrapper is never a limitation.
+
+Two habits the helpers encode, because they are easy to get wrong by hand:
+
+* **Never act on your own messages.** The event channel echoes what the bot sends, and a
+  bot that reacts to its own output loops. :meth:`Bot.watch` stops that by tracking the
+  bot's own id and skipping its messages, so a handler cannot forget.
+* **Reconcile after a disconnect.** The server relays events best-effort and does not
+  replay them (:mod:`openfield_bot` docs, ``bots.md`` 9.3), so :meth:`Bot.watch` polls as
+  well as subscribes.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+import queue
+import threading
+import time
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+from . import _transport
+from ._transport import Transport
+from .errors import BotError, InvalidArgumentError, UnauthorizedError
+
+__all__ = ["Bot", "Event", "REACTIONS", "VISIBILITIES"]
+
+#: The reaction keys the server accepts, in its own order (``bots.md`` 7.5).
+REACTIONS = ("like", "dislike", "love", "haha", "wow", "sad", "angry")
+
+#: The visibility values the server accepts (``bots.md`` 7.4).
+VISIBILITIES = ("public", "login", "friends", "private")
+
+
+class Event(dict):
+    """One realtime event.
+
+    A plain ``dict`` subclass, so ``event["data"]`` works and so does ``event.type``.
+    """
+
+    @property
+    def type(self) -> str:
+        """The event type, e.g. ``"chat.message.created"``."""
+        return self.get("event", "")
+
+    @property
+    def data(self) -> dict[str, Any]:
+        """The event payload."""
+        return self.get("data") or {}
+
+    @property
+    def recipients(self) -> list[Any]:
+        """The addressed user ids; empty means the event was broadcast."""
+        return self.get("recipients") or []
+
+    def is_broadcast(self) -> bool:
+        """Whether the event was sent to everyone."""
+        return not self.recipients
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"<Event {self.type} keys={sorted(self.data)[:6]}>"
+
+
+class _EventAdapter:
+    """Wrap a transport's event iterator so it yields :class:`Event` objects.
+
+    A thin adapter rather than a generator, because a generator would postpone the
+    subscription to the first ``next()``, and a caller that checks the server before
+    iterating would then see nothing.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __iter__(self) -> "_EventAdapter":
+        return self
+
+    def __next__(self) -> Event:
+        return Event(next(self._inner))
+
+    def close(self) -> None:
+        """Drop the subscription."""
+        self._inner.close()
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """The stream counters, when the backend exposes them."""
+        return getattr(self._inner, "stats", {}) or {}
+
+    def __enter__(self) -> "_EventAdapter":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"<BotEvents via {self._inner!r}>"
+
+
+class Bot:
+    """An OpenField bot client.
+
+    Args:
+        base_url: the instance root, e.g. ``"https://openfield.example.com"``. Defaults to
+            the server's own default of ``http://localhost:8080``.
+        token: the bot token, ``ofb_`` plus 64 lowercase hex characters. Omit it for the
+            public endpoints only.
+        backend: ``"sidecar"``, ``"ffi"``, or ``"auto"`` (default). ``auto`` prefers the
+            sidecar, because it needs no ABI match and cannot segfault the interpreter.
+        sidecar_path: an explicit sidecar binary, overriding discovery.
+        library_path: an explicit shared library, overriding discovery.
+        timeout_ms: per-request timeout. The default is the server's own 30 s.
+        connect_timeout_ms: connection-establishment timeout.
+        user_agent: the ``User-Agent`` header; identify your bot, as ``bots.md`` 15.2 asks.
+        headers: extra headers sent on every request.
+        max_response_bytes: refuse a response larger than this.
+        retry: overrides for the retry policy, e.g. ``{"max_attempts": 5}``. Applied by
+            the Rust core: GET and HEAD retry on transport failures and 5xx, every verb
+            retries on 429 honouring ``Retry-After``, and a mutating verb is never
+            replayed on 5xx.
+        reconnect: overrides for the event-stream reconnect policy.
+        transport: an already-built transport, for tests or a custom backend.
+
+    A ``Bot`` is a context manager, so ``with Bot(...) as bot:`` closes the transport on
+    exit.
+    """
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        token: Optional[str] = None,
+        *,
+        backend: str = "auto",
+        sidecar_path: Optional[str | os.PathLike[str]] = None,
+        library_path: Optional[str | os.PathLike[str]] = None,
+        timeout_ms: Optional[int] = None,
+        connect_timeout_ms: Optional[int] = None,
+        user_agent: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+        max_response_bytes: Optional[int] = None,
+        retry: Optional[dict[str, Any]] = None,
+        reconnect: Optional[dict[str, Any]] = None,
+        transport: Optional[Transport] = None,
+    ) -> None:
+        self._me: Optional[dict[str, Any]] = None
+        self._own_id: Optional[int] = None
+
+        if transport is not None:
+            self._transport = transport
+            return
+
+        options: dict[str, Any] = {}
+        if base_url:
+            options["base_url"] = base_url
+        if token:
+            options["token"] = token
+        if timeout_ms is not None:
+            options["timeout_ms"] = timeout_ms
+        if connect_timeout_ms is not None:
+            options["connect_timeout_ms"] = connect_timeout_ms
+        if user_agent is not None:
+            options["user_agent"] = user_agent
+        if headers:
+            options["headers"] = headers
+        if max_response_bytes is not None:
+            options["max_response_bytes"] = max_response_bytes
+        if retry is not None:
+            options["retry"] = retry
+        if reconnect is not None:
+            options["reconnect"] = reconnect
+
+        self._transport = self._build_transport(backend, options, sidecar_path, library_path)
+
+    @staticmethod
+    def _build_transport(
+        backend: str,
+        options: dict[str, Any],
+        sidecar_path: Optional[str | os.PathLike[str]],
+        library_path: Optional[str | os.PathLike[str]],
+    ) -> Transport:
+        """Pick a backend, honouring ``backend`` and falling back only when asked."""
+        from .ffi import FfiTransport
+        from .sidecar import SidecarTransport
+
+        choice = backend.lower()
+        if choice == "sidecar":
+            return SidecarTransport(sidecar_path, options=options)
+        if choice == "ffi":
+            return FfiTransport(library_path, options=options)
+        if choice != "auto":
+            raise InvalidArgumentError(
+                f"unknown backend {backend!r}; expected 'auto', 'sidecar' or 'ffi'"
+            )
+
+        try:
+            return SidecarTransport(sidecar_path, options=options)
+        except BotError:
+            # Only a missing sidecar justifies the fallback; a crash or a bad
+            # configuration should surface as itself rather than as a second failure.
+            return FfiTransport(library_path, options=options)
+
+    # -- plumbing ----------------------------------------------------------
+
+    @property
+    def transport(self) -> Transport:
+        """The active backend, for diagnostics."""
+        return self._transport
+
+    @property
+    def backend(self) -> str:
+        """The active backend's name."""
+        return self._transport.name
+
+    def call(self, method: str, **params: Any) -> Any:
+        """Run any method from the shared index and return its result.
+
+        This is the escape hatch for anything without a wrapper::
+
+            bot.call("posts.create", content="hello", visibility="public")
+            bot.call("chat.settings", conversation_id=33,
+                     settings={"is_public": False, "allow_join": True})
+
+        Raises:
+            openfield_bot.BotError: for any failure the SDK reports.
+        """
+        return self._transport.call(method, params or None)
+
+    def capabilities(self) -> dict[str, Any]:
+        """The SDK's protocol revision, feature flags and every method name."""
+        return self.call("capabilities")
+
+    def version(self) -> dict[str, Any]:
+        """The SDK version and protocol revision."""
+        return self.call("version")
+
+    def close(self) -> None:
+        """Release the transport. Safe to call more than once."""
+        self._transport.close()
+
+    def __enter__(self) -> "Bot":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        who = self._me.get("username") if self._me else None
+        return f"<Bot {who or 'unauthenticated'} via {self._transport.name}>"
+
+    # -- identity ----------------------------------------------------------
+
+    def me(self, *, refresh: bool = False) -> dict[str, Any]:
+        """This bot's own user record, cached after the first call."""
+        if self._me is None or refresh:
+            self._me = self.call("me")
+            self._own_id = self._me.get("id")
+        return self._me
+
+    @property
+    def id(self) -> Optional[int]:
+        """This bot's user id, fetching it on first use."""
+        if self._own_id is None:
+            self.me()
+        return self._own_id
+
+    @property
+    def username(self) -> Optional[str]:
+        """This bot's username."""
+        return self.me().get("username")
+
+    def permissions(self) -> dict[str, Any]:
+        """The permission keys this bot holds, plus the groups they came from."""
+        return self.call("permissions")
+
+    def startup_check(self) -> dict[str, Any]:
+        """Validate the token and report every administrative permission that is missing.
+
+        Run this once at startup: a bot that starts without checking discovers a missing
+        permission as a ``403`` in the middle of a job (``bots.md`` 16.1).
+        """
+        return self.call("startup_check")
+
+    def require_permission(self, permission: str) -> None:
+        """Fail early with :class:`UnauthorizedError` when a permission is missing.
+
+        Args:
+            permission: a permission key, e.g. ``"posts.create"``.
+
+        Raises:
+            UnauthorizedError: naming the missing key, so the operator knows what to grant.
+        """
+        held = self.permissions()
+        if permission not in (held.get("permissions") or []):
+            raise UnauthorizedError(
+                f"this bot lacks the {permission!r} permission; ask an administrator to "
+                f"grant it to the bot's role",
+                permission=permission,
+            )
+
+    def update_profile(self, **profile: Any) -> dict[str, Any]:
+        """Update the bot's profile.
+
+        Accepts ``username``, ``nickname``, ``bio``. The nickname limit is measured in
+        Unicode code points, not bytes (``bots.md`` 6.4).
+        """
+        return self.call("update_profile", profile=profile)
+
+    def user(self, user_id: int) -> dict[str, Any]:
+        """One user's public profile."""
+        return self.call("user", user_id=user_id)
+
+    def search_users(self, query: str) -> Any:
+        """Search users by name."""
+        return self.call("search_users", query=query)
+
+    def follow(self, user_id: int) -> Any:
+        """Follow a user."""
+        return self.call("follow", user_id=user_id)
+
+    def unfollow(self, user_id: int) -> Any:
+        """Unfollow a user."""
+        return self.call("unfollow", user_id=user_id)
+
+    def storage_usage(self) -> dict[str, Any]:
+        """Attachment storage usage for this bot."""
+        return self.call("storage_usage")
+
+    def storage_buckets(self) -> Any:
+        """The storage buckets available to this bot."""
+        return self.call("storage_buckets")
+
+    def set_storage_bucket(self, bucket: str) -> Any:
+        """Choose which bucket new uploads go to."""
+        return self.call("set_storage_bucket", bucket=bucket)
+
+    # -- bots --------------------------------------------------------------
+
+    def create_bot(self, username: str, nickname: str) -> dict[str, Any]:
+        """Create a new bot under this account.
+
+        The returned token is shown **once**; store it before doing anything else. A
+        single owner may hold at most 10 bots (``bots.md`` 5.3).
+
+        Note:
+            A username must be 3-32 characters of ``[A-Za-z0-9_]``.
+        """
+        return self.call("bots.create", username=username, nickname=nickname)
+
+    def list_bots(self) -> dict[str, Any]:
+        """Every bot this account owns, with quotas."""
+        return self.call("bots.list")
+
+    def regenerate_token(self, bot_id: int, *, adopt: bool = False) -> dict[str, Any]:
+        """Rotate a bot's token.
+
+        Args:
+            bot_id: the bot whose token to rotate.
+            adopt: switch this client to the new token immediately. Use it when the
+                rotated bot is the one this client runs as, because the old token dies at
+                once (``bots.md`` 5.4).
+        """
+        return self.call("bots.regenerate", bot_id=bot_id, adopt=adopt)
+
+    def delete_bot(self, bot_id: int) -> Any:
+        """Permanently delete a bot and its token."""
+        return self.call("bots.delete", bot_id=bot_id)
+
+    def find_bot(self, username: str) -> Optional[dict[str, Any]]:
+        """Look a bot up by username, or ``None``."""
+        for bot in self.list_bots().get("bots", []):
+            if bot.get("username") == username:
+                return bot
+        return None
+
+    # -- posts -------------------------------------------------------------
+
+    def publish(self, content: str, **options: Any) -> dict[str, Any]:
+        """Publish a post.
+
+        Args:
+            content: the body. At most 5000 **bytes**, which for CJK text is well under
+                5000 characters.
+            **options: ``visibility``, ``attachments`` (a list of attachment ids),
+                ``camp_id``, ``quoted_post_id``.
+
+        Raises:
+            InvalidArgumentError: for content over the byte limit, or more than 9
+                attachments.
+        """
+        return self.call("posts.create", content=content, **options)
+
+    def posts(self, *, page: Optional[int] = None, limit: Optional[int] = None) -> dict[str, Any]:
+        """The global post feed."""
+        return self.call("posts.list", **{k: v for k, v in {"page": page, "limit": limit}.items() if v is not None})
+
+    def search_posts(self, query: Optional[str] = None, **filters: Any) -> dict[str, Any]:
+        """Search posts by keyword, camp, author, and so on."""
+        params = dict(filters)
+        if query is not None:
+            params["q"] = query
+        return self.call("posts.search", query=params)
+
+    def post(self, post_id: int) -> dict[str, Any]:
+        """One post with its aggregate counters."""
+        return self.call("posts.get", post_id=post_id)
+
+    def update_post(self, post_id: int, post: dict[str, Any]) -> dict[str, Any]:
+        """Replace a post's editable fields."""
+        return self.call("posts.update", post_id=post_id, post=post)
+
+    def delete_post(self, post_id: int) -> Any:
+        """Delete a post."""
+        return self.call("posts.delete", post_id=post_id)
+
+    def pin_post(self, post_id: int, pinned: bool = True) -> Any:
+        """Pin or unpin a post."""
+        return self.call("posts.pin", post_id=post_id, pinned=pinned)
+
+    def react(self, post_id: int, reaction: str) -> Any:
+        """React to a post.
+
+        Args:
+            reaction: one of :data:`REACTIONS`. The server rejects anything else, and
+                enforces one reaction per user per post.
+        """
+        if reaction not in REACTIONS:
+            raise InvalidArgumentError(
+                f"unknown reaction {reaction!r}; expected one of {', '.join(REACTIONS)}"
+            )
+        return self.call("posts.react", post_id=post_id, reaction=reaction)
+
+    def unreact(self, post_id: int) -> Any:
+        """Remove this bot's reaction from a post."""
+        return self.call("posts.unreact", post_id=post_id)
+
+    def favorite(self, post_id: int, *, favorite: bool = True) -> Any:
+        """Add or remove a post from the bot's favourites."""
+        method = "posts.favorite" if favorite else "posts.unfavorite"
+        return self.call(method, post_id=post_id)
+
+    def reply(self, post_id: int, content: str, **options: Any) -> dict[str, Any]:
+        """Reply to a post, with the same byte limit as a post."""
+        return self.call("posts.reply", post_id=post_id, content=content, **options)
+
+    def replies(
+        self, post_id: int, *, page: Optional[int] = None, limit: Optional[int] = None
+    ) -> dict[str, Any]:
+        """A post's replies, oldest first."""
+        params = {
+            key: value for key, value in {"page": page, "limit": limit}.items() if value is not None
+        }
+        return self.call("posts.replies", post_id=post_id, **params)
+
+    # -- chat --------------------------------------------------------------
+
+    def conversations(self) -> Any:
+        """Every conversation this bot belongs to."""
+        return self.call("chat.conversations")
+
+    def create_conversation(self, title: str) -> dict[str, Any]:
+        """Create a group conversation.
+
+        Args:
+            title: required -- the server binds it and rejects an empty one (``bots.md``
+                8.1).
+        """
+        return self.call("chat.create", title=title)
+
+    def conversation(self, conversation_id: int) -> dict[str, Any]:
+        """One conversation's metadata, including whether this bot is a member."""
+        return self.call("chat.get", conversation_id=conversation_id)
+
+    def update_conversation(
+        self,
+        conversation_id: int,
+        *,
+        is_public: Optional[bool] = None,
+        allow_join: Optional[bool] = None,
+        encrypted: Optional[bool] = None,
+    ) -> dict[str, Any]:
+        """Change a conversation's settings. Only the fields you pass are sent."""
+        settings = {
+            key: value
+            for key, value in {
+                "is_public": is_public,
+                "allow_join": allow_join,
+                "encrypted": encrypted,
+            }.items()
+            if value is not None
+        }
+        return self.call("chat.settings", conversation_id=conversation_id, settings=settings)
+
+    def messages(
+        self,
+        conversation_id: int,
+        *,
+        limit: Optional[int] = None,
+        before: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """A page of history, **newest first**.
+
+        Note:
+            The bundled ``bots.md`` 7.3 claims this is oldest-first. It is not: the
+            handler sorts by ``created_at DESC, id DESC``. Sort explicitly if you need
+            chronological order.
+        """
+        params = {
+            key: value
+            for key, value in {"limit": limit, "before": before}.items()
+            if value is not None
+        }
+        return self.call("chat.messages", conversation_id=conversation_id, **params)
+
+    def latest_messages(
+        self, conversation_id: int, *, limit: Optional[int] = None
+    ) -> dict[str, Any]:
+        """The newest messages, for a first run or after a reconnect."""
+        params = {"limit": limit} if limit is not None else {}
+        return self.call("chat.latest", conversation_id=conversation_id, **params)
+
+    def send_message(
+        self,
+        conversation_id: int,
+        content: str,
+        *,
+        reply_to_id: Optional[int] = None,
+        mentions: Optional[list[int]] = None,
+        burn_seconds: Optional[int] = None,
+        attachments: Optional[list[int]] = None,
+    ) -> dict[str, Any]:
+        """Send a chat message.
+
+        Args:
+            conversation_id: where to send it.
+            content: the body, at most 5000 **bytes**.
+            reply_to_id: the message this one answers.
+            mentions: user ids to notify. ``-1`` (``MENTION_EVERYONE``) pings everyone.
+            burn_seconds: delete the message after this long. The server accepts ``0``
+                (never) or ``5..=86400`` (``bots.md`` 9.4).
+            attachments: attachment ids to attach.
+        """
+        params: dict[str, Any] = {"conversation_id": conversation_id, "content": content}
+        if reply_to_id is not None:
+            params["reply_to_id"] = reply_to_id
+        if mentions:
+            params["mentions"] = mentions
+        if burn_seconds is not None:
+            params["burn_seconds"] = burn_seconds
+        if attachments:
+            params["attachments"] = attachments
+        return self.call("chat.send", **params)
+
+    def edit_message(self, conversation_id: int, message_id: int, content: str) -> dict[str, Any]:
+        """Edit a message this bot sent."""
+        return self.call(
+            "chat.edit",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            content=content,
+        )
+
+    def delete_message(self, conversation_id: int, message_id: int) -> Any:
+        """Delete a message."""
+        return self.call("chat.delete", conversation_id=conversation_id, message_id=message_id)
+
+    def mark_read(self, conversation_id: int, last_message_id: int = 0) -> Any:
+        """Advance this bot's read cursor.
+
+        Args:
+            last_message_id: the newest message seen; ``0`` marks the whole conversation
+                read. The server binds this field name (``bots.md`` 8.7).
+        """
+        return self.call(
+            "chat.read", conversation_id=conversation_id, last_message_id=last_message_id
+        )
+
+    def typing(self, conversation_id: int) -> Any:
+        """Show a typing indicator in a conversation."""
+        return self.call("chat.typing", conversation_id=conversation_id)
+
+    def join_conversation(self, conversation_id: int) -> Any:
+        """Join a public conversation."""
+        return self.call("chat.join", conversation_id=conversation_id)
+
+    def invite(
+        self, conversation_id: int, user_id: int, message: Optional[str] = None
+    ) -> Any:
+        """Invite a user.
+
+        The server files a **consent request** rather than adding them directly, which
+        the invitee must accept (``bots.md`` 8.5); watch for the
+        ``chat.consent.requested`` event.
+        """
+        params: dict[str, Any] = {"conversation_id": conversation_id, "user_id": user_id}
+        if message is not None:
+            params["message"] = message
+        return self.call("chat.invite", **params)
+
+    def leave_conversation(self, conversation_id: int) -> Any:
+        """Leave a conversation."""
+        return self.call("chat.leave", conversation_id=conversation_id)
+
+    def remove_member(self, conversation_id: int, user_id: int) -> Any:
+        """Remove a member."""
+        return self.call(
+            "chat.remove_member", conversation_id=conversation_id, user_id=user_id
+        )
+
+    def start_conversation(
+        self, user_id: int, message: Optional[str] = None, *, encrypted: bool = False
+    ) -> dict[str, Any]:
+        """Open (or reuse) a direct conversation with a user."""
+        params: dict[str, Any] = {"user_id": user_id, "encrypted": encrypted}
+        if message is not None:
+            params["message"] = message
+        return self.call("chat.start", **params)
+
+    def consent_requests(self) -> Any:
+        """Pending consent requests addressed to this bot."""
+        return self.call("chat.consent_requests")
+
+    def accept_consent(self, request_id: int) -> Any:
+        """Accept a consent request."""
+        return self.call("chat.accept_consent", request_id=request_id)
+
+    def decline_consent(self, request_id: int) -> Any:
+        """Decline a consent request."""
+        return self.call("chat.decline_consent", request_id=request_id)
+
+    def conversation_files(self, conversation_id: int) -> Any:
+        """Files shared in a conversation."""
+        return self.call("chat.files", conversation_id=conversation_id)
+
+    # -- camps -------------------------------------------------------------
+
+    def camps(self, **filters: Any) -> Any:
+        """List camps, with optional ``q``/``page``/``limit`` filters."""
+        return self.call("camps.list", query=filters)
+
+    def camp(self, camp_id: int) -> dict[str, Any]:
+        """One camp."""
+        return self.call("camps.get", camp_id=camp_id)
+
+    def create_camp(self, name: str, **options: Any) -> dict[str, Any]:
+        """Create a camp.
+
+        Args:
+            name: required, and unique across the instance.
+            **options: ``description``, ``is_visible``, ``direct_join``, ``member_post``,
+                ``member_pin``, ``parent_camp_id``.
+        """
+        return self.call("camps.create", camp={"name": name, **options})
+
+    def update_camp(self, camp_id: int, **changes: Any) -> dict[str, Any]:
+        """Change some of a camp's fields."""
+        return self.call("camps.update", camp_id=camp_id, update=changes)
+
+    def delete_camp(self, camp_id: int) -> Any:
+        """Delete a camp."""
+        return self.call("camps.delete", camp_id=camp_id)
+
+    def camp_posts(
+        self, camp_id: int, *, page: Optional[int] = None, limit: Optional[int] = None
+    ) -> dict[str, Any]:
+        """A camp's posts."""
+        params = {
+            key: value for key, value in {"page": page, "limit": limit}.items() if value is not None
+        }
+        return self.call("camps.posts", camp_id=camp_id, **params)
+
+    def join_camp(self, camp_id: int) -> Any:
+        """Join a camp."""
+        return self.call("camps.join", camp_id=camp_id)
+
+    def leave_camp(self, camp_id: int) -> Any:
+        """Leave a camp."""
+        return self.call("camps.leave", camp_id=camp_id)
+
+    def camp_members(self, camp_id: int) -> Any:
+        """A camp's members."""
+        return self.call("camps.members", camp_id=camp_id)
+
+    def camp_subgroups(self, camp_id: int) -> Any:
+        """A camp's subgroups."""
+        return self.call("camps.subgroups", camp_id=camp_id)
+
+    def post_to_camp(self, camp_id: int, content: str, **options: Any) -> dict[str, Any]:
+        """Publish a post into a camp."""
+        return self.call("camps.post", camp_id=camp_id, content=content, **options)
+
+    # -- storage -----------------------------------------------------------
+
+    def upload(
+        self, file_name: str, data: bytes, *, mime: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Upload bytes and return the attachment record.
+
+        Args:
+            file_name: the name the server records.
+            data: the raw bytes. They cross as base64, so a large file does not become a
+                million-element JSON array.
+            mime: overrides the type guessed from the extension.
+        """
+        upload: dict[str, Any] = {
+            "file_name": file_name,
+            "bytes": base64.b64encode(data).decode("ascii"),
+        }
+        if mime is not None:
+            upload["mime"] = mime
+        return self.call("storage.upload", upload=upload)
+
+    def upload_file(self, path: str | os.PathLike[str], **options: Any) -> dict[str, Any]:
+        """Upload a file from disk."""
+        target = Path(path)
+        return self.upload(target.name, target.read_bytes(), **options)
+
+    def uploads(self, files: list[dict[str, Any]]) -> Any:
+        """Upload several files in one call.
+
+        Each entry is ``{"file_name": ..., "bytes": <base64 or list>, "mime": ...}``.
+        """
+        return self.call("storage.upload_many", uploads=files)
+
+    def attachments(self) -> Any:
+        """This bot's uploaded attachments."""
+        return self.call("storage.list")
+
+    def delete_attachment(self, attachment_id: int) -> Any:
+        """Delete an attachment."""
+        return self.call("storage.delete", attachment_id=attachment_id)
+
+    # -- moderation, notifications, instance -------------------------------
+
+    #: The report target kinds the server accepts.
+    REPORT_TARGETS = ("post", "message", "user")
+
+    def report(self, target_type: str, target_id: int, reason: str) -> Any:
+        """Report a post, message or user.
+
+        Args:
+            target_type: one of :attr:`REPORT_TARGETS`. The server binds this field and
+                rejects anything else, so it is validated here as well.
+            target_id: the reported resource.
+            reason: why. At most 500 characters.
+
+        Note:
+            A bot may file at most 20 reports per hour (``bots.md`` 12.1); the 21st is a
+            :class:`~openfield_bot.RateLimitedError`.
+        """
+        if target_type not in self.REPORT_TARGETS:
+            raise InvalidArgumentError(
+                f"unknown report target {target_type!r}; expected one of "
+                f"{', '.join(self.REPORT_TARGETS)}"
+            )
+        report = {"target_type": target_type, "target_id": target_id, "reason": reason}
+        return self.call("reports.create", report=report)
+
+    def report_post(self, post_id: int, reason: str) -> Any:
+        """Report a post."""
+        return self.report("post", post_id, reason)
+
+    def report_message(self, message_id: int, reason: str) -> Any:
+        """Report a chat message."""
+        return self.report("message", message_id, reason)
+
+    def report_user(self, user_id: int, reason: str) -> Any:
+        """Report a user."""
+        return self.report("user", user_id, reason)
+
+    def my_reports(self) -> Any:
+        """The reports this bot has filed."""
+        return self.call("reports.mine")
+
+    def notifications(self) -> Any:
+        """Unread notifications."""
+        return self.call("notifications.list")
+
+    def read_notifications(self) -> Any:
+        """Mark every notification read."""
+        return self.call("notifications.read")
+
+    def health(self) -> dict[str, Any]:
+        """The instance health report. Requires no token."""
+        return self.call("health")
+
+    def announcements(self, *, all: bool = False) -> Any:  # noqa: A002 - matches the API
+        """Server announcements."""
+        return self.call("announcements", all=all)
+
+    # -- raw ---------------------------------------------------------------
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Optional[dict[str, Any]] = None,
+        body: Optional[Any] = None,
+        bytes: Optional[bytes] = None,  # noqa: A002 - mirrors the payload field
+    ) -> dict[str, Any]:
+        """Perform a raw request and return ``{"ok", "status", "body"}``.
+
+        Does **not** raise on a non-2xx status: the envelope carries it, so a caller can
+        deliberately handle a ``409`` or read a ``404`` body.
+        """
+        from .ffi import FfiTransport
+
+        params: dict[str, Any] = {"method": method, "path": path}
+        if query:
+            params["query"] = {k: str(v) for k, v in query.items()}
+        if body is not None:
+            params["body"] = body
+        if bytes is not None:
+            params["bytes"] = list(bytes)
+
+        if isinstance(self._transport, FfiTransport):
+            return self._transport.raw_request(params)
+        return self._transport.call("request", params)
+
+    # -- events ------------------------------------------------------------
+
+    def events(
+        self,
+        *,
+        types: Optional[list[str]] = None,
+        conversation_ids: Optional[list[int]] = None,
+        queue_capacity: Optional[int] = None,
+        reconnect: Optional[dict[str, Any]] = None,
+    ) -> "_EventAdapter":
+        """Subscribe to the realtime channel and return an event iterator.
+
+        The subscription is established before this returns, so the server already counts
+        the connection -- and a broadcast sent immediately afterwards cannot be missed.
+
+        Args:
+            types: event types to keep; omit for all of them.
+            conversation_ids: restrict chat events to these conversations.
+            queue_capacity: how many events to buffer before dropping the oldest.
+            reconnect: overrides for the reconnect policy.
+
+        Returns:
+            An iterator of :class:`Event` objects, which is also a context manager.
+
+        Note:
+            Delivery is best effort. The server relays through Postgres ``NOTIFY`` and
+            does not replay across a disconnect, so anything polled (**votes**, tips,
+            wallet changes) must be reconciled periodically rather than assumed from the
+            event stream (``bots.md`` 9.3). :meth:`watch` does that for chat.
+        """
+        params: dict[str, Any] = {}
+        if types:
+            params["types"] = types
+        if conversation_ids:
+            params["conversation_ids"] = conversation_ids
+        if queue_capacity is not None:
+            params["queue_capacity"] = queue_capacity
+        if reconnect is not None:
+            params["reconnect"] = reconnect
+
+        return _EventAdapter(self._transport.events(params or None))
+
+    def watch(
+        self,
+        conversation_id: int,
+        *,
+        poll_interval: float = 5.0,
+        types: Optional[list[str]] = None,
+        since: Optional[int] = None,
+        max_events: Optional[int] = None,
+        settle: float = 0.2,
+    ) -> Iterator[Event]:
+        """Follow one conversation, merging the event stream with polling.
+
+        Implements the reliable half of the ``bots.md`` 9.2/9.3 recipe:
+
+        * events arrive immediately while the connection is up, because a background
+          thread drains the subscription into a local queue;
+        * a poll of ``chat.latest`` runs every `poll_interval` seconds, so a message sent
+          while the bot was disconnected is still seen;
+        * the bot's own messages are skipped, because the event channel echoes what the
+          bot sends and a bot that answers itself loops forever;
+        * ids are de-duplicated, so the same message delivered by both paths yields once.
+
+        Args:
+            conversation_id: the conversation to follow.
+            poll_interval: seconds between reconciliation polls.
+            types: restrict the subscription, e.g. ``["chat.message.created"]``.
+            since: the last message id already handled; anything at or below it is
+                skipped. Defaults to the newest message, so a restart does not replay
+                history.
+            max_events: stop after this many messages, for a finite job.
+            settle: how long to sleep between checks, so this does not spin the CPU.
+
+        Yields:
+            :class:`Event` objects of type ``chat.message.created``, for messages that
+            came from someone else. Everything else is filtered out -- including the
+            ``connected`` greeting, which would otherwise consume a ``max_events`` budget
+            with something that is not a message. Use :meth:`events` for the unfiltered
+            stream.
+
+        Example::
+
+            for event in bot.watch(33):
+                if "ping" in event.data["content"]:
+                    bot.send_message(33, "pong", reply_to_id=event.data["id"])
+        """
+        if since is None:
+            page = self.latest_messages(conversation_id, limit=1)
+            newest = _newest_message_id(page)
+            since = newest if newest is not None else 0
+
+        own_id = self.id
+        seen: set[int] = set()
+        highest = since
+
+        inbox: queue.Queue[Any] = queue.Queue()
+        subscription = self.events(
+            types=types or ["chat.message.created"],
+            conversation_ids=[conversation_id],
+        )
+
+        def pump() -> None:
+            """Drain the subscription into the local queue, off the caller's thread."""
+            try:
+                for event in subscription:
+                    inbox.put(event)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
+                inbox.put(exc)
+            finally:
+                inbox.put(None)
+
+        threading.Thread(target=pump, name="openfield-watch", daemon=True).start()
+        # The subscription must be released when the caller stops iterating -- otherwise
+        # the connection outlives its consumer, and a backend whose handle is freed at
+        # close would be read by a thread that no longer has any business reading it.
+        try:
+            yield from self._watch_loop(
+                inbox, conversation_id, highest, seen, own_id, poll_interval, max_events, settle
+            )
+        finally:
+            subscription.close()
+
+    def _watch_loop(
+        self,
+        inbox: "queue.Queue[Any]",
+        conversation_id: int,
+        highest: int,
+        seen: set[int],
+        own_id: Optional[int],
+        poll_interval: float,
+        max_events: Optional[int],
+        settle: float,
+    ) -> Iterator[Event]:
+        """Merge the subscription's queue with periodic reconciliation polls."""
+        emitted = 0
+        next_poll = 0.0
+
+        while True:
+            # 1. Anything the subscription already delivered.
+            while True:
+                try:
+                    item = inbox.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    raise BotError("the event subscription closed")
+                if isinstance(item, BaseException):
+                    raise item
+                for event in _filter_events([item], conversation_id, highest, seen, own_id):
+                    highest = max(highest, event.data["id"])
+                    emitted += 1
+                    # Yield first, then check the budget: returning before the yield would
+                    # silently drop the last message of a finite run.
+                    yield event
+                    if max_events is not None and emitted >= max_events:
+                        return
+
+            # 2. Reconcile: catch anything sent while the subscription was down.
+            if time.monotonic() >= next_poll:
+                next_poll = time.monotonic() + poll_interval
+                for message in _poll_new_messages(self, conversation_id, highest, own_id):
+                    if message["id"] in seen:
+                        continue
+                    highest = max(highest, message["id"])
+                    seen.add(message["id"])
+                    emitted += 1
+                    yield Event(
+                        {"event": "chat.message.created", "data": message, "recipients": []}
+                    )
+                    if max_events is not None and emitted >= max_events:
+                        return
+
+            time.sleep(settle)
+
+
+def _message_id(message: dict[str, Any]) -> Optional[int]:
+    """The id of a message dict, tolerating an id the server marshalled as a string."""
+    raw = message.get("id")
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _page_items(page: Any) -> list[dict[str, Any]]:
+    """Pull the message list out of whichever envelope the endpoint returned."""
+    if isinstance(page, list):
+        return [item for item in page if isinstance(item, dict)]
+    if isinstance(page, dict):
+        for key in ("messages", "items", "data", "list"):
+            value = page.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _newest_message_id(page: Any) -> Optional[int]:
+    """The largest id in a page.
+
+    The handler sorts newest-first, so this is normally the head -- but the SDK must not
+    depend on an ordering the server is free to change, so it takes the maximum.
+    """
+    ids = [mid for mid in (_message_id(item) for item in _page_items(page)) if mid is not None]
+    return max(ids) if ids else None
+
+
+def _is_own(message: dict[str, Any], own_id: Optional[int]) -> bool:
+    """Whether a message is this bot's own.
+
+    Checked by id rather than by trust in ``sender_is_bot`` alone, because two bots in one
+    conversation must still be able to talk to each other.
+    """
+    sender = message.get("sender_id")
+    if sender is None:
+        sender = message.get("user_id")
+    return own_id is not None and sender == own_id
+
+
+def _filter_events(
+    events: list[Event],
+    conversation_id: int,
+    since: int,
+    seen: set[int],
+    own_id: Optional[int],
+) -> list[Event]:
+    """Keep only new, actionable ``chat.message.created`` events for this conversation.
+
+    Everything else is dropped, including the ``connected`` greeting the server sends to
+    every new subscriber. ``watch`` promises messages, so handing the caller a connection
+    notice -- or a typing indicator -- would be a surprise, and passing the greeting
+    through would consume a caller's ``max_events`` budget with something that is not a
+    message at all. Use :meth:`Bot.events` for the unfiltered stream.
+    """
+    kept: list[Event] = []
+    for event in events:
+        if event.type != "chat.message.created":
+            continue
+        data = event.data
+        if data.get("conversation_id") not in (None, conversation_id):
+            continue
+        mid = _message_id(data)
+        if mid is None or mid <= since or mid in seen or _is_own(data, own_id):
+            continue
+        seen.add(mid)
+        kept.append(event)
+    return kept
+
+
+def _poll_new_messages(
+    bot: Bot, conversation_id: int, since: int, own_id: Optional[int]
+) -> list[dict[str, Any]]:
+    """Ask for messages newer than `since` that this bot did not send, oldest first."""
+    page = bot.latest_messages(conversation_id, limit=50)
+    fresh = []
+    for message in _page_items(page):
+        mid = _message_id(message)
+        if mid is None or mid <= since or _is_own(message, own_id):
+            continue
+        fresh.append(message)
+    fresh.sort(key=lambda item: _message_id(item) or 0)
+    return fresh

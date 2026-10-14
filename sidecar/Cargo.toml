@@ -1,0 +1,24 @@
+[package]
+name = "openfield-bot-sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JSON-RPC sidecar exposing the OpenField bot SDK to any language"
+
+[[bin]]
+name = "openfield-bot-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+openfield-bot-sdk = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+# Enables the `testkit.start` method, which runs the in-process mock OpenField server.
+# Off by default so a production sidecar ships without a mock server inside it; the
+# Python and Node suites build the sidecar with this feature.
+testkit = ["openfield-bot-sdk/testkit"]
